@@ -1,0 +1,25 @@
+name: ゲストハウス 抽選自動申込
+
+on:
+  schedule:
+    - cron: '0 22 * * *'    # 毎日 22:00 UTC = 翌朝 7:00 JST に実行
+  workflow_dispatch:         # 手動実行も可能
+
+jobs:
+  lottery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: ライブラリインストール
+        run: pip install -r requirements.txt
+
+      - name: 抽選自動申込
+        run: python miwa_auto_lottery.py
+        env:
+          MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
+          MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
