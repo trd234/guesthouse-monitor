@@ -1,0 +1,35 @@
+name: ゲストハウス 空き監視
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # 5分ごとに実行（GitHub Actionsの最短間隔）
+  workflow_dispatch:         # 手動実行も可能
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: ライブラリインストール
+        run: pip install -r requirements.txt
+
+      # 前回の状態ファイルをキャッシュから復元（重複通知を防ぐため）
+      - name: 前回の状態を復元
+        uses: actions/cache@v4
+        with:
+          path: miwa_state.json
+          key: miwa-state-${{ github.run_id }}
+          restore-keys: |
+            miwa-state-
+
+      - name: ゲストハウス空き状況チェック＆LINE通知
+        run: python miwa_monitor.py
+        env:
+          MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
+          MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
