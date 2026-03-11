@@ -1,12 +1,12 @@
-name: 共用施設 抽選自動申込
+name: 共用施設 空き自動予約
 
 on:
   schedule:
-    - cron: '0 22 * * *'    # 毎日 22:00 UTC = 翌朝 7:00 JST に実行
+    - cron: '*/5 * * * *'   # 5分ごとに実行（GitHub Actionsの最短間隔）
   workflow_dispatch:         # 手動実行も可能
 
 jobs:
-  lottery:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -18,10 +18,20 @@ jobs:
       - name: ライブラリインストール
         run: pip install -r requirements.txt
 
-      - name: 抽選自動申込
-        run: python miwa_auto_lottery.py
+      # 前回の状態ファイルをキャッシュから復元（重複通知を防ぐため）
+      - name: 前回の状態を復元
+        uses: actions/cache@v5
+        with:
+          path: miwa_state.json
+          key: miwa-state-${{ github.run_id }}
+          restore-keys: |
+            miwa-state-
+
+      - name: 空き状況チェック＆自動予約
+        run: python miwa_monitor.py
         env:
           MIWA_BASE_URL: ${{ secrets.MIWA_BASE_URL }}
-          MIWA_FACILITY_ID_RESERVE: ${{ secrets.MIWA_FACILITY_ID_RESERVE }}
+          MIWA_FACILITY_ID: ${{ secrets.MIWA_FACILITY_ID }}
           MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
           MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
