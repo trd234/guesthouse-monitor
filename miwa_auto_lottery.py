@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-MIWA LOCK ゲストハウス 抽選自動申込スクリプト
+共用施設予約サイト 抽選自動申込スクリプト
 毎日1回実行 → 60日後が土日祝なら昼枠・夜枠の抽選申込を自動で行う
 
 予約フロー:
-  1. GET  /reserve/register/100371/detail/?datetime=...&kbn=1  → CSRFトークン取得
-  2. POST /reserve/register/100371/confirm                      → 予約内容確認
-  3. GET  /reserve/register/100371/save                          → 予約確定
+  1. GET  detail page  → CSRFトークン取得
+  2. POST confirm      → 予約内容確認
+  3. GET  save         → 予約確定
 """
 
 import os
@@ -22,11 +22,11 @@ except ImportError:
     print("⚠️ jpholiday 未インストール（祝日判定なし、土日のみ対象）")
 
 # ============================================================
-# 設定
+# 設定（マンション固有の値は環境変数から取得）
 # ============================================================
-BASE_URL = "https://mitagh.miwalinks.jp"
+BASE_URL = os.environ.get("MIWA_BASE_URL", "")
 LOGIN_URL = f"{BASE_URL}/login"
-FACILITY_ID = "100371"  # 昼枠・夜枠片方ご利用
+FACILITY_ID = os.environ.get("MIWA_FACILITY_ID_RESERVE", "")
 CALCFEE_API = f"{BASE_URL}/api/reserve/calcfee"
 
 HEADERS = {
@@ -203,11 +203,15 @@ def apply_lottery(session: requests.Session, target_date: date, slot: dict) -> b
 # メイン
 # ============================================================
 def main():
+    if not BASE_URL or not FACILITY_ID:
+        print("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID_RESERVE が未設定です")
+        return
+
     target = date.today() + timedelta(days=DAYS_AHEAD)
     weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target.weekday()]
 
     print(f"{'='*50}")
-    print(f"ゲストハウス抽選自動申込")
+    print(f"共用施設 抽選自動申込")
     print(f"対象日: {target}（{weekday_ja}）")
     print(f"{'='*50}")
 
