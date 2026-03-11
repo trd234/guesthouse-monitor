@@ -1,9 +1,7 @@
 name: 共用施設 空き自動予約
 
 on:
-  schedule:
-    - cron: '*/5 * * * *'   # 5分ごとに実行（GitHub Actionsの最短間隔）
-  workflow_dispatch:         # 手動実行も可能
+  workflow_dispatch:         # 外部cron（cron-job.org）または手動で実行
 
 jobs:
   check:
