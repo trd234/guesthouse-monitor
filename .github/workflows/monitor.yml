@@ -30,6 +30,7 @@ jobs:
         env:
           MIWA_BASE_URL: ${{ secrets.MIWA_BASE_URL }}
           MIWA_FACILITY_ID: ${{ secrets.MIWA_FACILITY_ID }}
+          
           MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
           MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
