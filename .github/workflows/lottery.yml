@@ -2,7 +2,7 @@ name: 共用施設 抽選自動申込
 
 on:
   schedule:
-    - cron: '0 22 * * *'    # 毎日 22:00 UTC = 翌朝 7:00 JST に実行
+    - cron: '0 1 * * *'     # 毎日 01:00 UTC = 10:00 JST に実行
   workflow_dispatch:         # 手動実行も可能
 
 jobs:
