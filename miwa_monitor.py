@@ -38,7 +38,7 @@ MONTHS_AHEAD = 2
 STATE_FILE = "miwa_state.json"
 
 # GitHub Actionsの最短cronは5分のため、1回の実行内で1分ごとに5回チェックし実質1分間隔を実現
-LOOP_COUNT = 5
+LOOP_COUNT = 4
 LOOP_INTERVAL_SEC = 60
 
 HEADERS = {
