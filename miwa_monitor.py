@@ -47,8 +47,13 @@ LOOP_INTERVAL_SEC = 60
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # 自動予約する枠の設定
@@ -156,15 +161,22 @@ def check_calendar(session: requests.Session) -> dict:
     """カレンダーAPIから各日の予約状況を取得する（親施設IDで監視）"""
     results = {}
     for year, month in get_months_to_check():
-        try:
-            resp = session.get(
-                CALENDAR_API,
-                params={"year": year, "month": month, "id": FACILITY_ID},
-                timeout=15,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"  ⚠️ カレンダー取得エラー ({year}/{month}): {e}")
+        resp = None
+        for attempt in range(3):
+            try:
+                if attempt > 0:
+                    time.sleep(5 * attempt)
+                resp = session.get(
+                    CALENDAR_API,
+                    params={"year": year, "month": month, "id": FACILITY_ID},
+                    timeout=20,
+                )
+                resp.raise_for_status()
+                break
+            except requests.RequestException as e:
+                print(f"  ⚠️ カレンダー取得エラー ({year}/{month}) 試行{attempt+1}/3: {e}")
+                resp = None
+        if resp is None:
             continue
 
         # クラス名に先頭スペースが付く場合があるため strip() で正規化
