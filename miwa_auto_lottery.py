@@ -292,7 +292,6 @@ def apply_lottery(session: requests.Session, target_date: date, slot: dict) -> b
         "selectStartDate": date_str,
         "selectStartDateTime": start_dt,
         "selectReserveNumber": 1,
-        "selectReserveKbn": "1",   # 抽選: "1" / 先着: "0"（不要なら無視される）
     }
     for opt_id, value in slot["options"].items():
         updates[f"selectOptionQuantities.{opt_id}"] = value
