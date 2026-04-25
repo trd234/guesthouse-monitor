@@ -137,7 +137,11 @@ def extract_facility_snapshot(session: requests.Session) -> tuple:
         try:
             d = json.loads(decoded)
             if "facility-detail" in d.get("memo", {}).get("name", ""):
-                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
+                xsrf_raw = next(
+                    (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
+                    ""
+                )
+                xsrf = urllib.parse.unquote(xsrf_raw)
                 return decoded, xsrf
         except (json.JSONDecodeError, KeyError):
             continue
@@ -224,7 +228,11 @@ def _handle_confirm_page(session: requests.Session, url: str) -> bool:
             d = json.loads(decoded)
             name = d.get("memo", {}).get("name", "")
             if any(k in name for k in ["confirm", "complete", "save"]):
-                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
+                xsrf_raw = next(
+                    (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
+                    ""
+                )
+                xsrf = urllib.parse.unquote(xsrf_raw)
                 for method in ["confirm", "save", "complete", "submit"]:
                     snap_str2, data2, effects2 = livewire_call(
                         session, decoded, xsrf,
