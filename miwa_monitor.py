@@ -432,9 +432,12 @@ def book_slot_livewire(
         print(f"    ⚠️ バリデーションエラー: {errors}")
         return False
 
-    # リダイレクトなし・エラーなし → 予約完了と判断
-    print(f"    ✅ {name} 予約完了！")
-    return True
+    # リダイレクトなし・エラーなし → 確認ページへ進めなかった（偽の成功を防ぐ）
+    html_snippet = str(effects.get("html", ""))[:300]
+    print(f"    ⚠️ 確認ページへ移動しませんでした（予約未完了）")
+    if html_snippet:
+        print(f"    コンポーネント状態: {html_snippet}")
+    return False
 
 
 def _handle_confirm_page(session: requests.Session, url: str) -> bool:
@@ -446,44 +449,67 @@ def _handle_confirm_page(session: requests.Session, url: str) -> bool:
         print(f"    ⚠️ 確認ページ取得エラー: {e}")
         return False
 
-    # Livewire スナップショットを探す
+    # Livewire スナップショットを全件収集
     snaps = re.findall(r'wire:snapshot="((?:&[^;]+;|[^"])+)"', resp.text)
+    candidates = []
     for s in snaps:
         decoded = html.unescape(s)
         try:
             d = json.loads(decoded)
-            name = d.get("memo", {}).get("name", "")
-            if any(k in name for k in ["confirm", "complete", "save"]):
-                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
-                for method in ["confirm", "save", "complete", "submit"]:
-                    snap_str2, data2, effects2 = livewire_call(
-                        session, decoded, xsrf,
-                        calls=[{"method": method, "params": []}],
-                    )
-                    if snap_str2 is None:
-                        continue
-                    # リダイレクトがあれば最終確認ページへ追跡する
-                    redirect2 = effects2.get("redirect")
-                    if redirect2:
-                        try:
-                            resp3 = session.get(redirect2, timeout=15)
-                            if "/reserves/" in resp3.url or "/reserves/" in resp3.text:
-                                print(f"    ✅ 予約確定完了！（{resp3.url}）")
-                                return True
-                        except requests.RequestException:
-                            pass
-                    if not effects2.get("errors"):
-                        print(f"    ✅ 予約確定完了！")
-                        return True
+            candidates.append((decoded, d))
         except (json.JSONDecodeError, KeyError):
             continue
 
-    # スナップショットが見つからない場合、ページに /reserves/{id} があれば成功
+    # 確認系コンポーネントを優先、なければ全候補を試す
+    target_kw = ["confirm", "complete", "save", "reserve", "apply", "detail"]
+    targets = [(dec, d) for dec, d in candidates
+               if any(k in d.get("memo", {}).get("name", "") for k in target_kw)]
+    if not targets:
+        targets = candidates
+
+    for decoded, d in targets:
+        try:
+            comp_data = d.get("data", {})
+            xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
+
+            # Step A: 利用規約同意チェックボックスを設定する
+            agree_props = ["agreeTerms", "agree", "isAgreed", "acceptTerms",
+                           "agreedToTerms", "acceptedTerms"]
+            agree_updates = {k: True for k in agree_props if k in comp_data}
+            if not agree_updates:
+                agree_updates = {"agreeTerms": True, "agree": True}
+            snap_agreed, _, _ = livewire_call(session, decoded, xsrf, updates=agree_updates)
+            use_snap = snap_agreed if snap_agreed else decoded
+
+            # Step B: 「予約する」ボタン相当のメソッドを試す
+            for method in ["apply", "reserve", "confirm", "submit",
+                           "save", "complete", "next", "applyLottery", "reserveLottery"]:
+                snap2, _, effects2 = livewire_call(
+                    session, use_snap, xsrf,
+                    calls=[{"method": method, "params": []}],
+                )
+                if snap2 is None:
+                    continue
+                redirect2 = effects2.get("redirect")
+                if redirect2:
+                    try:
+                        resp3 = session.get(redirect2, timeout=15)
+                        if "/reserves/" in resp3.url or "/reserves/" in resp3.text:
+                            print(f"    ✅ 予約確定完了！（{resp3.url}）")
+                            return True
+                    except requests.RequestException:
+                        pass
+                if not effects2.get("errors"):
+                    print(f"    ✅ 予約確定完了！（method={method}）")
+                    return True
+        except (json.JSONDecodeError, KeyError):
+            continue
+
     if "/reserves/" in resp.url or "/reserves/" in resp.text:
         print(f"    ✅ 予約完了！（確認ページ: {resp.url}）")
         return True
 
-    print(f"    ⚠️ 確認処理が不明: {url}")
+    print(f"    ⚠️ 確認ページの処理に失敗しました: {url}")
     return False
 
 
