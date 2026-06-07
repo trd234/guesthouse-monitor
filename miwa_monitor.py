@@ -214,11 +214,7 @@ def extract_facility_snapshot(session: requests.Session) -> tuple:
         try:
             d = json.loads(decoded)
             if "facility-detail" in d.get("memo", {}).get("name", ""):
-                xsrf_raw = next(
-                    (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
-                    ""
-                )
-                xsrf = urllib.parse.unquote(xsrf_raw)
+                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
                 return decoded, xsrf
         except (json.JSONDecodeError, KeyError):
             continue
@@ -242,6 +238,14 @@ def livewire_call(
         updates = {}
     if calls is None:
         calls = []
+
+    # 毎回セッションCookieから最新のXSRFトークンを取得（古いトークンで419エラーになるのを防ぐ）
+    fresh_xsrf_raw = next(
+        (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
+        ""
+    )
+    if fresh_xsrf_raw:
+        xsrf = urllib.parse.unquote(fresh_xsrf_raw)
 
     body = {
         "components": [{
@@ -268,13 +272,12 @@ def livewire_call(
         return None, None, {}
 
     if resp.status_code != 200:
-        print(f"  ⚠️ Livewire エラー: {resp.status_code}")
+        print(f"  ⚠️ Livewire エラー: {resp.status_code} {resp.text[:200]}")
         return None, None, {}
 
-    # XSRF トークンを更新
+    # レスポンスのXSRFトークンをセッションに反映（requestsが自動処理しない場合の補完）
     new_xsrf_enc = resp.cookies.get("XSRF-TOKEN")
     if new_xsrf_enc:
-        # session.cookies を更新するため直接セット
         session.cookies.set("XSRF-TOKEN", new_xsrf_enc)
 
     try:
@@ -451,17 +454,25 @@ def _handle_confirm_page(session: requests.Session, url: str) -> bool:
             d = json.loads(decoded)
             name = d.get("memo", {}).get("name", "")
             if any(k in name for k in ["confirm", "complete", "save"]):
-                xsrf_raw = next(
-                    (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
-                    ""
-                )
-                xsrf = urllib.parse.unquote(xsrf_raw)
+                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
                 for method in ["confirm", "save", "complete", "submit"]:
                     snap_str2, data2, effects2 = livewire_call(
                         session, decoded, xsrf,
                         calls=[{"method": method, "params": []}],
                     )
-                    if snap_str2 and not effects2.get("errors"):
+                    if snap_str2 is None:
+                        continue
+                    # リダイレクトがあれば最終確認ページへ追跡する
+                    redirect2 = effects2.get("redirect")
+                    if redirect2:
+                        try:
+                            resp3 = session.get(redirect2, timeout=15)
+                            if "/reserves/" in resp3.url or "/reserves/" in resp3.text:
+                                print(f"    ✅ 予約確定完了！（{resp3.url}）")
+                                return True
+                        except requests.RequestException:
+                            pass
+                    if not effects2.get("errors"):
                         print(f"    ✅ 予約確定完了！")
                         return True
         except (json.JSONDecodeError, KeyError):
