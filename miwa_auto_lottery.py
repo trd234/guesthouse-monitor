@@ -81,6 +81,35 @@ def is_weekend_or_holiday(d: date) -> bool:
 
 
 # ============================================================
+# Cookie ヘルパー（XSRF-TOKEN 重複対策）
+# ============================================================
+# requests の cookies.get("XSRF-TOKEN") は、同名 Cookie が
+# ドメイン/パス違いで複数あると CookieConflictError を投げる。
+# Laravel + Livewire は遷移中に XSRF-TOKEN を別パスへ再発行するため
+# 重複が起きやすい。以下のヘルパーで安全に読み書きする。
+def _iter_xsrf_values(jar) -> list:
+    """CookieJar 内の XSRF-TOKEN の値を、登録順（古い→新しい）で返す。"""
+    return [c.value for c in jar if c.name == "XSRF-TOKEN"]
+
+
+def _get_xsrf_token(session: requests.Session) -> str:
+    """セッションから XSRF-TOKEN を安全に取得し、URL デコードして返す。
+    複数あれば最後（最新）を採用。無ければ空文字。例外は投げない。"""
+    values = _iter_xsrf_values(session.cookies)
+    return urllib.parse.unquote(values[-1]) if values else ""
+
+
+def _set_xsrf_token(session: requests.Session, raw_value: str) -> None:
+    """XSRF-TOKEN をセットする前に既存の同名 Cookie を全て削除し、
+    ドメイン/パス違いの重複が蓄積しないようにする。raw_value は
+    URL エンコード済み（Cookie 生値）を渡す。"""
+    for cookie in list(session.cookies):
+        if cookie.name == "XSRF-TOKEN":
+            session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+    session.cookies.set("XSRF-TOKEN", raw_value)
+
+
+# ============================================================
 # ログイン
 # ============================================================
 def create_session() -> requests.Session:
@@ -137,7 +166,7 @@ def extract_facility_snapshot(session: requests.Session) -> tuple:
         try:
             d = json.loads(decoded)
             if "facility-detail" in d.get("memo", {}).get("name", ""):
-                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
+                xsrf = _get_xsrf_token(session)
                 return decoded, xsrf
         except (json.JSONDecodeError, KeyError):
             continue
@@ -163,12 +192,9 @@ def livewire_call(
         calls = []
 
     # 毎回セッションCookieから最新のXSRFトークンを取得（古いトークンで419エラーになるのを防ぐ）
-    fresh_xsrf_raw = next(
-        (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
-        ""
-    )
-    if fresh_xsrf_raw:
-        xsrf = urllib.parse.unquote(fresh_xsrf_raw)
+    fresh_xsrf = _get_xsrf_token(session)
+    if fresh_xsrf:
+        xsrf = fresh_xsrf
 
     body = {
         "components": [{
@@ -199,9 +225,10 @@ def livewire_call(
         return None, None, {}
 
     # レスポンスのXSRFトークンをセッションに反映（requestsが自動処理しない場合の補完）
-    new_xsrf_enc = resp.cookies.get("XSRF-TOKEN")
-    if new_xsrf_enc:
-        session.cookies.set("XSRF-TOKEN", new_xsrf_enc)
+    # 重複 Cookie を作らないよう、_set_xsrf_token で既存を消してから登録する。
+    resp_xsrf_values = _iter_xsrf_values(resp.cookies)
+    if resp_xsrf_values:
+        _set_xsrf_token(session, resp_xsrf_values[-1])
 
     try:
         result = resp.json()
@@ -245,7 +272,7 @@ def _handle_confirm_page(session: requests.Session, url: str) -> bool:
     for decoded, d in targets:
         try:
             comp_data = d.get("data", {})
-            xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
+            xsrf = _get_xsrf_token(session)
 
             # Step A: 利用規約同意チェックボックスを設定する
             agree_props = ["agreeTerms", "agree", "isAgreed", "acceptTerms",
