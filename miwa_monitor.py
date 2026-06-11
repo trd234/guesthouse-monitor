@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-共用施設予約サイト キャンセル空き自動予約スクリプト（サイトリニューアル対応版）
-GitHub Actions で5分ごとに起動 → 内部で1分ごとに5回チェック = 実質1分間隔
+共用施設予約サイト キャンセル空き自動予約スクリプト（サイトリニューアル対応版 2）
+GitHub Actions（外部cron）で起動 → 内部で1分ごとに複数回チェック = 実質1分間隔
 
-カレンダーで「available」（先着予約可能）を検知したら Livewire API で自動予約を行い、
-予約完了時に LINE 通知を送る。
+【リニューアル後の仕組み】
+旧サイトの /api/reserve/calendar は廃止され、空き情報は施設詳細ページの
+Livewire コンポーネント（pages.reserve.facility-detail）の中に入っている。
+このスクリプトは施設詳細を Livewire で開き、各日を selectStartDate で選択して
+「予約可能な開始時刻（startDateTimes）」が返ってくるかどうかで空きを判定する。
+ステータス文字列（"reserved"/"unreservable" 等）の推測には依存しない。
+
+  ・土日祝に空きを検知 → 自動予約を実行（/reserves/{id} 到達で完了確定）
+  ・平日に空きを検知   → 通知のみ（自動予約なし）
 """
 
 import os
@@ -16,7 +23,6 @@ import urllib.parse
 import requests
 from pathlib import Path
 from datetime import datetime, date, timezone, timedelta
-from bs4 import BeautifulSoup
 
 try:
     import jpholiday
@@ -26,23 +32,26 @@ except ImportError:
 # ============================================================
 # 設定（マンション固有の値は環境変数から取得）
 # ============================================================
-BASE_URL = os.environ.get("MIWA_BASE_URL", "")
+BASE_URL = os.environ.get("MIWA_BASE_URL", "").rstrip("/")
 LOGIN_URL = f"{BASE_URL}/login"
-CALENDAR_API = f"{BASE_URL}/api/reserve/calendar"
 LIVEWIRE_UPDATE = f"{BASE_URL}/livewire/update"
 
-FACILITY_ID = os.environ.get("MIWA_FACILITY_ID", "")          # 監視用（親）: 100310
-FACILITY_ID_RESERVE = os.environ.get("MIWA_FACILITY_ID_RESERVE", "")  # 予約用（子）: 100371
+# 予約・監視の対象施設（子施設ID）。例: VILLA／1階 GUEST HOUSE（片方ご利用）の詳細ページ
+FACILITY_ID_RESERVE = os.environ.get("MIWA_FACILITY_ID_RESERVE", "")
+FACILITY_URL = f"{BASE_URL}/facilities/{FACILITY_ID_RESERVE}"
 
 # 当月＋2ヶ月先までチェック（計3ヶ月分）
 MONTHS_AHEAD = 2
 
-# 前回の状態を保存するファイル
+# 前回の状態を保存するファイル（重複通知・二重予約を防ぐ）
 STATE_FILE = "miwa_state.json"
 
-# GitHub Actionsの最短cronは5分のため、1回の実行内で1分ごとに5回チェックし実質1分間隔を実現
+# GitHub Actionsの最短cronは5分のため、1回の実行内で1分ごとに複数回チェックし実質1分間隔を実現
 LOOP_COUNT = 5
 LOOP_INTERVAL_SEC = 60
+
+# 連続リクエストでサーバに負荷をかけないための待機（秒）
+PROBE_PAUSE_SEC = 0.3
 
 HEADERS = {
     "User-Agent": (
@@ -57,23 +66,18 @@ HEADERS = {
 }
 
 # 自動予約する枠の設定
-# option_id: Livewire の selectOptionQuantities.{option_id} に対応
+# option_id: Livewire の selectOptionQuantities.{option_id} に対応（診断で確認済み）
+#   46 = 21時までの利用人数（0〜8）
+#   49 = 21時以降の利用人数（0〜4）
+#   61 = 夜枠用チェックイン予定時間（0=未選択 / 1=17:00〜19:00 ...）
 SLOT_OPTIONS = {
     "1100": {
         "name": "昼枠（11:00〜15:00）",
-        "options": {
-            46: 8,   # 21時までの利用人数: 8名
-            49: 0,   # 21時以降: 不要
-            61: 0,   # チェックイン時間: 不要
-        },
+        "options": {46: 8, 49: 0, 61: 0},
     },
     "1700": {
         "name": "夜枠（17:00〜翌9:00）",
-        "options": {
-            46: 8,   # 21時までの利用人数: 8名
-            49: 4,   # 21時以降の利用人数: 4名
-            61: 1,   # チェックイン予定時間: 1 = 17:00〜19:00
-        },
+        "options": {46: 8, 49: 4, 61: 1},
     },
 }
 
@@ -91,19 +95,49 @@ def is_weekend_or_holiday(d: date) -> bool:
     return False
 
 
+def weekday_ja(d: date) -> str:
+    return ["月", "火", "水", "木", "金", "土", "日"][d.weekday()]
+
+
 # ============================================================
 # 状態の読み書き
 # ============================================================
 def load_state() -> dict:
     if Path(STATE_FILE).exists():
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"calendar": {}, "booked": []}
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                st = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            st = {}
+    else:
+        st = {}
+    st.setdefault("booked", [])      # 自動予約に成功した "YYYY-MM-DD_HHMM"
+    st.setdefault("notified", [])    # 空き通知済みの "YYYY-MM-DD_HHMM"
+    return st
 
 
 def save_state(state: dict):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
+
+
+# ============================================================
+# Cookie ヘルパー（XSRF-TOKEN 重複対策）
+# ============================================================
+def _iter_xsrf_values(jar) -> list:
+    return [c.value for c in jar if c.name == "XSRF-TOKEN"]
+
+
+def _get_xsrf_token(session: requests.Session) -> str:
+    values = _iter_xsrf_values(session.cookies)
+    return urllib.parse.unquote(values[-1]) if values else ""
+
+
+def _set_xsrf_token(session: requests.Session, raw_value: str) -> None:
+    for cookie in list(session.cookies):
+        if cookie.name == "XSRF-TOKEN":
+            session.cookies.clear(cookie.domain, cookie.path, cookie.name)
+    session.cookies.set("XSRF-TOKEN", raw_value)
 
 
 # ============================================================
@@ -134,7 +168,7 @@ def create_session() -> requests.Session:
     resp.raise_for_status()
 
     if "/login" in resp.url:
-        print("  ⚠️ ログイン失敗")
+        print("  ⚠️ ログイン失敗（ID/パスワードをご確認ください）")
         return None
 
     print("  ログイン成功")
@@ -142,96 +176,35 @@ def create_session() -> requests.Session:
 
 
 # ============================================================
-# カレンダーチェック（旧APIを継続使用）
-# ============================================================
-def get_months_to_check() -> list:
-    today = date.today()
-    months = []
-    y, m = today.year, today.month
-    for _ in range(MONTHS_AHEAD + 1):
-        months.append((y, m))
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-    return months
-
-
-def check_calendar(session: requests.Session) -> dict:
-    """カレンダーAPIから各日の予約状況を取得する（親施設IDで監視）"""
-    results = {}
-    for year, month in get_months_to_check():
-        resp = None
-        for attempt in range(3):
-            try:
-                if attempt > 0:
-                    time.sleep(5 * attempt)
-                resp = session.get(
-                    CALENDAR_API,
-                    params={"year": year, "month": month, "id": FACILITY_ID},
-                    timeout=20,
-                )
-                resp.raise_for_status()
-                break
-            except requests.RequestException as e:
-                print(f"  ⚠️ カレンダー取得エラー ({year}/{month}) 試行{attempt+1}/3: {e}")
-                resp = None
-        if resp is None:
-            continue
-
-        # クラス名に先頭スペースが付く場合があるため strip() で正規化
-        for match in re.finditer(
-            r'<td class="([^"]+)">\s*<a class="link_area">(\d+)</a>\s*</td>',
-            resp.text,
-        ):
-            status = match.group(1).strip()
-            day = int(match.group(2))
-            date_str = f"{year}-{month:02d}-{day:02d}"
-            results[date_str] = status
-
-    return results
-
-
-# ============================================================
 # Livewire API ヘルパー
 # ============================================================
 def extract_facility_snapshot(session: requests.Session) -> tuple:
-    """施設予約ページ（/facilities/{id}）から wire:snapshot を取得する。
-    戻り値: (snapshot_str, xsrf_token)
+    """施設詳細ページ（/facilities/{id}）から facility-detail の wire:snapshot を取得する。
+    戻り値: (snapshot_str, xsrf_token) または (None, None)
     """
-    facility_url = f"{BASE_URL}/facilities/{FACILITY_ID_RESERVE}"
     try:
-        resp = session.get(facility_url, timeout=15)
+        resp = session.get(FACILITY_URL, timeout=15)
         resp.raise_for_status()
     except requests.RequestException as e:
         print(f"  ⚠️ 施設ページ取得エラー: {e}")
         return None, None
 
-    # wire:snapshot 属性を抽出（HTML エスケープ済みの JSON 文字列として取得）
     snaps = re.findall(r'wire:snapshot="((?:&[^;]+;|[^"])+)"', resp.text)
     for s in snaps:
         decoded = html.unescape(s)
         try:
             d = json.loads(decoded)
-            if "facility-detail" in d.get("memo", {}).get("name", ""):
-                xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
-                return decoded, xsrf
-        except (json.JSONDecodeError, KeyError):
+        except json.JSONDecodeError:
             continue
+        if "facility-detail" in d.get("memo", {}).get("name", ""):
+            return decoded, _get_xsrf_token(session)
 
-    print("  ⚠️ Livewire スナップショットが見つかりません")
+    print("  ⚠️ 施設詳細の Livewire スナップショットが見つかりません")
     return None, None
 
 
-def livewire_call(
-    session: requests.Session,
-    snap_str: str,
-    xsrf: str,
-    updates: dict = None,
-    calls: list = None,
-) -> tuple:
+def livewire_call(session, snap_str, xsrf, updates=None, calls=None) -> tuple:
     """Livewire update エンドポイントを呼び出す。
-    snap_str: wire:snapshot の JSON 文字列（HTML アンエスケープ済み）
     戻り値: (new_snap_str, new_data, effects) または (None, None, {})
     """
     if updates is None:
@@ -239,21 +212,11 @@ def livewire_call(
     if calls is None:
         calls = []
 
-    # 毎回セッションCookieから最新のXSRFトークンを取得（古いトークンで419エラーになるのを防ぐ）
-    fresh_xsrf_raw = next(
-        (c.value for c in reversed(list(session.cookies)) if c.name == "XSRF-TOKEN"),
-        ""
-    )
-    if fresh_xsrf_raw:
-        xsrf = urllib.parse.unquote(fresh_xsrf_raw)
+    fresh_xsrf = _get_xsrf_token(session)
+    if fresh_xsrf:
+        xsrf = fresh_xsrf
 
-    body = {
-        "components": [{
-            "snapshot": snap_str,
-            "updates": updates,
-            "calls": calls,
-        }]
-    }
+    body = {"components": [{"snapshot": snap_str, "updates": updates, "calls": calls}]}
 
     try:
         resp = session.post(
@@ -263,7 +226,7 @@ def livewire_call(
                 "X-XSRF-TOKEN": xsrf,
                 "X-Livewire": "true",
                 "Accept": "application/json",
-                "Referer": f"{BASE_URL}/facilities/{FACILITY_ID_RESERVE}",
+                "Referer": FACILITY_URL,
             },
             timeout=20,
         )
@@ -275,15 +238,13 @@ def livewire_call(
         print(f"  ⚠️ Livewire エラー: {resp.status_code} {resp.text[:200]}")
         return None, None, {}
 
-    # レスポンスのXSRFトークンをセッションに反映（requestsが自動処理しない場合の補完）
-    new_xsrf_enc = resp.cookies.get("XSRF-TOKEN")
-    if new_xsrf_enc:
-        session.cookies.set("XSRF-TOKEN", new_xsrf_enc)
+    resp_xsrf_values = _iter_xsrf_values(resp.cookies)
+    if resp_xsrf_values:
+        _set_xsrf_token(session, resp_xsrf_values[-1])
 
     try:
-        result = resp.json()
-        comp = result["components"][0]
-        new_snap_str = comp["snapshot"]  # 既に JSON 文字列
+        comp = resp.json()["components"][0]
+        new_snap_str = comp["snapshot"]
         new_data = json.loads(new_snap_str)["data"]
         effects = comp.get("effects", {})
         return new_snap_str, new_data, effects
@@ -293,155 +254,189 @@ def livewire_call(
 
 
 # ============================================================
-# 利用可能スロットの取得（Livewire ベース）
+# Livewire データ構造のヘルパー
 # ============================================================
-def get_available_slots_livewire(
-    session: requests.Session, date_str: str
-) -> list:
-    """Livewire API で指定日の利用可能スロットを取得する。
-    戻り値: [{"time": "1100", "name": "昼枠...", "start_dt": "2026-04-20T11:00:00+09:00"}, ...]
+def _unwrap_arr(v):
+    """Livewire は配列を [payload, {"s":"arr"}] の形でラップする。payload を取り出す。"""
+    if isinstance(v, list) and len(v) == 2 and isinstance(v[1], dict) and v[1].get("s") == "arr":
+        return v[0]
+    return v
+
+
+def _carbon_to_str(item):
+    """Carbon 値 ["2026-06-27T11:00:00+09:00", {...}] や 文字列・辞書から ISO 文字列を取り出す。"""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, list) and item and isinstance(item[0], str):
+        return item[0]
+    if isinstance(item, dict):
+        for k in ("value", "start", "datetime", "date"):
+            v = item.get(k)
+            if isinstance(v, str):
+                return v
+            if isinstance(v, list) and v and isinstance(v[0], str):
+                return v[0]
+    return None
+
+
+def parse_start_times(data: dict) -> list:
+    """選択中の日付に対する予約可能な開始時刻を、対象枠（昼枠/夜枠）に絞って返す。
+    戻り値: [{"time": "1100", "name": "昼枠...", "start_dt": "...ISO..."}, ...]
     """
+    raw = _unwrap_arr(data.get("startDateTimes", []))
+    if isinstance(raw, dict):
+        items = list(raw.keys())          # value→label 形式の select の場合
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+
+    slots = []
+    seen = set()
+    for item in items:
+        dt_str = _carbon_to_str(item)
+        if not dt_str:
+            continue
+        hour = None
+        try:
+            hour = datetime.fromisoformat(dt_str).hour
+        except ValueError:
+            m = re.search(r'\b(\d{1,2}):(\d{2})\b', dt_str)
+            if m:
+                hour = int(m.group(1))
+        if hour is None:
+            continue
+        if hour == 11:
+            time_code = "1100"
+        elif hour == 17:
+            time_code = "1700"
+        else:
+            continue  # 対象外の時間帯（昼枠/夜枠以外）
+        if time_code in seen:
+            continue
+        seen.add(time_code)
+        slots.append({
+            "time": time_code,
+            "name": SLOT_OPTIONS[time_code]["name"],
+            "start_dt": dt_str,
+        })
+    return slots
+
+
+# ============================================================
+# 空きスキャン
+# ============================================================
+def get_candidate_dates() -> list:
+    """今日から当月＋MONTHS_AHEAD ヶ月の末日までの date を列挙する。"""
+    today = date.today()
+    y, m = today.year, today.month
+    m += MONTHS_AHEAD
+    while m > 12:
+        m -= 12
+        y += 1
+    next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+    end = date(next_y, next_m, 1) - timedelta(days=1)
+    days, d = [], today
+    while d <= end:
+        days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def scan_availability(session, target_days: list) -> dict:
+    """指定した日付リストを Livewire で順に選択し、各日の空き枠を調べる。
+    1回の GET で取得したスナップショットを使い回し、selectStartDate を連続で更新する。
+    戻り値: {"YYYY-MM-DD": [slot, ...], ...}（空きのある日だけ）
+    """
+    results = {}
+    if not target_days:
+        return results
+
     snap_str, xsrf = extract_facility_snapshot(session)
     if not snap_str:
-        return []
+        return results
 
-    # 日付を選択して startDateTimes を取得
-    snap_str, data, _ = livewire_call(
-        session, snap_str, xsrf,
-        updates={"selectStartDate": date_str},
-    )
-    if not snap_str or data is None:
-        return []
+    for d in target_days:
+        date_str = d.isoformat()
+        new_snap, data, _ = livewire_call(session, snap_str, xsrf, updates={"selectStartDate": date_str})
+        if not new_snap or data is None:
+            # スナップショットが壊れた可能性 → 取り直して1回だけ再試行
+            snap_str, xsrf = extract_facility_snapshot(session)
+            if not snap_str:
+                break
+            new_snap, data, _ = livewire_call(session, snap_str, xsrf, updates={"selectStartDate": date_str})
+            if not new_snap or data is None:
+                continue
+        snap_str = new_snap
 
-    # startDateTimes の構造: [[dt1, dt2, ...], {"s": "arr"}]
-    raw_dts = data.get("startDateTimes", [])
-    if isinstance(raw_dts, list) and len(raw_dts) >= 1:
-        dt_list = raw_dts[0]
-        if isinstance(dt_list, list):
-            slots = []
-            for item in dt_list:
-                # Carbon 形式 ["ISO_STRING", {...}] または 文字列
-                if isinstance(item, list) and len(item) >= 1:
-                    dt_str = item[0]
-                elif isinstance(item, str):
-                    dt_str = item
-                else:
-                    continue
+        slots = parse_start_times(data)
+        if slots:
+            results[date_str] = slots
+        time.sleep(PROBE_PAUSE_SEC)
 
-                try:
-                    dt = datetime.fromisoformat(dt_str)
-                    hour = dt.hour
-                    if hour == 11:
-                        time_code = "1100"
-                    elif hour == 17:
-                        time_code = "1700"
-                    else:
-                        continue  # 対象外の時間帯
-
-                    if time_code in SLOT_OPTIONS:
-                        slots.append({
-                            "time": time_code,
-                            "name": SLOT_OPTIONS[time_code]["name"],
-                            "start_dt": dt_str,
-                        })
-                except (ValueError, IndexError):
-                    continue
-
-            if slots:
-                return slots
-
-    # startDateTimes が空の場合、SLOT_OPTIONS の固定時間帯を試みる
-    # （先着可能状態だが Livewire がまだ更新されていない場合のフォールバック）
-    print(f"  （startDateTimes 空のため固定スロットで試みます）")
-    fallback = []
-    for time_code, opt in SLOT_OPTIONS.items():
-        hour = int(time_code[:2])
-        minute = int(time_code[2:])
-        start_dt = f"{date_str}T{hour:02d}:{minute:02d}:00+09:00"
-        fallback.append({
-            "time": time_code,
-            "name": opt["name"],
-            "start_dt": start_dt,
-        })
-    return fallback
+    return results
 
 
 # ============================================================
 # 自動予約（Livewire ベース）
 # ============================================================
-def book_slot_livewire(
-    session: requests.Session, date_str: str, slot: dict
-) -> bool:
-    """Livewire API を使って1スロットの予約を実行する。"""
+def book_slot(session, date_str: str, slot: dict) -> str:
+    """1枠の予約を試みる。戻り値: "booked"（完了） / "partial"（未確定） / "failed"。"""
     time_code = slot["time"]
     name = slot["name"]
     start_dt = slot["start_dt"]
-
     print(f"    [{name}] 予約開始 (date={date_str}, start={start_dt})")
 
-    # Step 1: 施設ページのスナップショット取得
     snap_str, xsrf = extract_facility_snapshot(session)
     if not snap_str:
-        return False
+        return "failed"
 
-    # Step 2: 日付を選択
-    snap_str, data, _ = livewire_call(
-        session, snap_str, xsrf,
-        updates={"selectStartDate": date_str},
-    )
+    # 日付を選択
+    snap_str, data, _ = livewire_call(session, snap_str, xsrf, updates={"selectStartDate": date_str})
     if not snap_str:
-        print(f"    ⚠️ 日付選択失敗")
-        return False
+        print("    ⚠️ 日付選択失敗")
+        return "failed"
 
-    # Step 3: 全オプションと日時をセット
-    opt_config = SLOT_OPTIONS[time_code]["options"]
+    # 日時・人数・オプションをまとめて設定
     updates = {
         "selectStartDate": date_str,
         "selectStartDateTime": start_dt,
         "selectReserveNumber": 1,
     }
-    for opt_id, value in opt_config.items():
+    for opt_id, value in SLOT_OPTIONS[time_code]["options"].items():
         updates[f"selectOptionQuantities.{opt_id}"] = value
-
-    snap_str, data, _ = livewire_call(
-        session, snap_str, xsrf,
-        updates=updates,
-    )
+    snap_str, data, _ = livewire_call(session, snap_str, xsrf, updates=updates)
     if not snap_str:
-        print(f"    ⚠️ オプション設定失敗")
-        return False
+        print("    ⚠️ オプション設定失敗")
+        return "failed"
 
-    # Step 4: next を呼び出して予約を進める
-    snap_str, data, effects = livewire_call(
-        session, snap_str, xsrf,
-        calls=[{"method": "next", "params": []}],
-    )
+    # next を呼び出して確認ステップへ進める
+    snap_str, data, effects = livewire_call(session, snap_str, xsrf, calls=[{"method": "next", "params": []}])
     if not snap_str:
-        print(f"    ⚠️ 予約送信失敗（スロットが既に埋まった可能性）")
-        return False
+        print("    ⚠️ 予約送信失敗（スロットが既に埋まった可能性）")
+        return "failed"
 
-    # リダイレクトがあれば確認ページへ
+    errors = effects.get("errors")
+    if errors:
+        print(f"    ⚠️ バリデーションエラー: {errors}")
+        return "failed"
+
     redirect_url = effects.get("redirect")
     if redirect_url:
         print(f"    確認ページへ移動: {redirect_url}")
-        return _handle_confirm_page(session, redirect_url)
+        if _confirm_and_verify(session, redirect_url):
+            print(f"    ✅ {name} 予約完了！")
+            return "booked"
+        print(f"    ⚠️ {name} は確認ページまで進みましたが自動確定できませんでした")
+        return "partial"
 
-    # エラーがあれば表示
-    errors = effects.get("errors", [])
-    if errors:
-        print(f"    ⚠️ バリデーションエラー: {errors}")
-        return False
-
-    # リダイレクトなし・エラーなし → 確認ページへ進めなかった（偽の成功を防ぐ）
-    html_snippet = str(effects.get("html", ""))[:300]
-    print(f"    ⚠️ 確認ページへ移動しませんでした（予約未完了）")
-    if html_snippet:
-        print(f"    コンポーネント状態: {html_snippet}")
-    return False
+    # redirect が無い場合は確定に至っていない（偽の成功を出さない）
+    print(f"    ⚠️ {name} は確認ページへ進めませんでした（未確定）")
+    return "partial"
 
 
-def _handle_confirm_page(session: requests.Session, url: str) -> bool:
-    """確認ページを取得し、Livewire の confirm/save メソッドを呼び出す。"""
+def _confirm_and_verify(session, url: str) -> bool:
+    """確認ページで確定操作を行い、予約一覧（/reserves/{id}）に到達できたら True。"""
     try:
         resp = session.get(url, timeout=15)
         resp.raise_for_status()
@@ -449,67 +444,54 @@ def _handle_confirm_page(session: requests.Session, url: str) -> bool:
         print(f"    ⚠️ 確認ページ取得エラー: {e}")
         return False
 
-    # Livewire スナップショットを全件収集
+    # 既に予約明細ページに到達していれば成功
+    if re.search(r"/reserves/\d+", resp.url) or re.search(r"/reserves/\d+", resp.text):
+        return True
+
     snaps = re.findall(r'wire:snapshot="((?:&[^;]+;|[^"])+)"', resp.text)
-    candidates = []
     for s in snaps:
         decoded = html.unescape(s)
         try:
             d = json.loads(decoded)
-            candidates.append((decoded, d))
-        except (json.JSONDecodeError, KeyError):
+        except json.JSONDecodeError:
             continue
+        comp_data = d.get("data", {})
+        xsrf = _get_xsrf_token(session)
 
-    # 確認系コンポーネントを優先、なければ全候補を試す
-    target_kw = ["confirm", "complete", "save", "reserve", "apply", "detail"]
-    targets = [(dec, d) for dec, d in candidates
-               if any(k in d.get("memo", {}).get("name", "") for k in target_kw)]
-    if not targets:
-        targets = candidates
+        # 利用規約同意などのチェックボックスがあれば true にする
+        agree_props = ["agreeTerms", "agree", "isAgreed", "acceptTerms",
+                       "agreedToTerms", "acceptedTerms", "isAgree"]
+        agree_updates = {k: True for k in agree_props if k in comp_data}
+        use_snap = decoded
+        if agree_updates:
+            snap_a, _, _ = livewire_call(session, decoded, xsrf, updates=agree_updates)
+            if snap_a:
+                use_snap = snap_a
 
-    for decoded, d in targets:
-        try:
-            comp_data = d.get("data", {})
-            xsrf = urllib.parse.unquote(session.cookies.get("XSRF-TOKEN", ""))
+        # 確定系メソッドを順に試し、/reserves/{id} に到達したら成功確定
+        for method in ["complete", "confirm", "reserve", "submit", "save",
+                       "next", "apply", "store"]:
+            snap2, _, effects2 = livewire_call(session, use_snap, xsrf,
+                                               calls=[{"method": method, "params": []}])
+            if snap2 is None:
+                continue
+            redirect2 = effects2.get("redirect")
+            if redirect2:
+                try:
+                    resp3 = session.get(redirect2, timeout=15)
+                    if re.search(r"/reserves/\d+", resp3.url) or re.search(r"/reserves/\d+", resp3.text):
+                        return True
+                except requests.RequestException:
+                    pass
 
-            # Step A: 利用規約同意チェックボックスを設定する
-            agree_props = ["agreeTerms", "agree", "isAgreed", "acceptTerms",
-                           "agreedToTerms", "acceptedTerms"]
-            agree_updates = {k: True for k in agree_props if k in comp_data}
-            if not agree_updates:
-                agree_updates = {"agreeTerms": True, "agree": True}
-            snap_agreed, _, _ = livewire_call(session, decoded, xsrf, updates=agree_updates)
-            use_snap = snap_agreed if snap_agreed else decoded
-
-            # Step B: 「予約する」ボタン相当のメソッドを試す
-            for method in ["apply", "reserve", "confirm", "submit",
-                           "save", "complete", "next", "applyLottery", "reserveLottery"]:
-                snap2, _, effects2 = livewire_call(
-                    session, use_snap, xsrf,
-                    calls=[{"method": method, "params": []}],
-                )
-                if snap2 is None:
-                    continue
-                redirect2 = effects2.get("redirect")
-                if redirect2:
-                    try:
-                        resp3 = session.get(redirect2, timeout=15)
-                        if "/reserves/" in resp3.url or "/reserves/" in resp3.text:
-                            print(f"    ✅ 予約確定完了！（{resp3.url}）")
-                            return True
-                    except requests.RequestException:
-                        pass
-                if not effects2.get("errors"):
-                    print(f"    ✅ 予約確定完了！（method={method}）")
-                    return True
-        except (json.JSONDecodeError, KeyError):
-            continue
-
-    if "/reserves/" in resp.url or "/reserves/" in resp.text:
-        print(f"    ✅ 予約完了！（確認ページ: {resp.url}）")
-        return True
-
-    print(f"    ⚠️ 確認ページの処理に失敗しました: {url}")
+    # 最後に予約一覧を見て、確定済みか最終確認
+    try:
+        resp_list = session.get(f"{BASE_URL}/reserves", timeout=15)
+        if re.search(r"/reserves/\d+", resp_list.text):
+            # 一覧に明細リンクがあるだけでは当該予約とは限らないため、慎重に partial 扱い
+            return False
+    except requests.RequestException:
+        pass
     return False
 
 
@@ -521,133 +503,125 @@ def _send_line_message(message: str):
     if not token:
         print("  ⚠️ LINE_CHANNEL_ACCESS_TOKEN が未設定です")
         return
-
     try:
         resp = requests.post(
             "https://api.line.me/v2/bot/message/broadcast",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json={"messages": [{"type": "text", "text": message}]},
             timeout=10,
         )
         if resp.status_code == 200:
-            print(f"  ✅ LINE通知を送信しました")
+            print("  ✅ LINE通知を送信しました")
         else:
             print(f"  ❌ LINE通知失敗: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"  ❌ LINE通知エラー: {e}")
 
 
-def send_booked_notification(date_str: str, booked_slots: list):
-    """自動予約完了時の通知（土日祝）"""
-    slots_text = "\n".join(f"  ・{s}" for s in booked_slots)
-    message = (
-        f"🏨【共用施設 自動予約完了】\n"
-        f"{date_str} の予約を確保しました！\n"
-        f"\n"
-        f"{slots_text}\n"
-        f"\n"
-        f"予約状況の確認👇\n"
-        f"{BASE_URL}/reserves"
+def send_booked_notification(date_str: str, booked_names: list):
+    slots_text = "\n".join(f"  ・{s}" for s in booked_names)
+    _send_line_message(
+        f"🏨【共用施設 自動予約完了】\n{date_str} の予約を確保しました！\n\n"
+        f"{slots_text}\n\n予約状況の確認👇\n{BASE_URL}/reserves"
     )
-    _send_line_message(message)
+
+
+def send_partial_notification(date_str: str, names: list):
+    slots_text = "\n".join(f"  ・{s}" for s in names)
+    _send_line_message(
+        f"🟠【共用施設 空き検知・要手動確認】\n{date_str} に空きを検知し予約を進めましたが、"
+        f"自動で確定できませんでした。\nお早めに手動でご確認ください👇\n\n"
+        f"{slots_text}\n\n{FACILITY_URL}"
+    )
 
 
 def send_vacancy_notification(date_str: str, slot_names: list):
-    """空き検知通知（平日 — 自動予約なし）"""
     slots_text = "\n".join(f"  ・{s}" for s in slot_names)
-    message = (
-        f"🟢【共用施設 空き検知】\n"
-        f"{date_str} に空きが出ました！（平日のため自動予約なし）\n"
-        f"\n"
-        f"{slots_text}\n"
-        f"\n"
-        f"手動で予約する👇\n"
-        f"{BASE_URL}/facilities/{FACILITY_ID_RESERVE}"
+    _send_line_message(
+        f"🟢【共用施設 空き検知】\n{date_str} に空きが出ました！（平日のため自動予約なし）\n\n"
+        f"{slots_text}\n\n手動で予約する👇\n{FACILITY_URL}"
     )
-    _send_line_message(message)
 
 
 # ============================================================
 # メイン処理
 # ============================================================
-def run_once(session: requests.Session, prev_state: dict) -> dict:
-    calendar = check_calendar(session)
-    if not calendar:
-        return prev_state
+def run_once(session, state: dict, loop_index: int) -> dict:
+    booked_list = state.get("booked", [])
+    notified_list = state.get("notified", [])
 
-    prev_cal = prev_state.get("calendar", {})
-    booked_list = prev_state.get("booked", [])
+    all_days = get_candidate_dates()
+    holidays = [d for d in all_days if is_weekend_or_holiday(d)]
+    weekdays = [d for d in all_days if not is_weekend_or_holiday(d)]
 
-    # 状況サマリ
-    available_dates = [d for d, s in calendar.items() if s == "available"]
-    reserved_dates = [d for d, s in calendar.items() if s == "reserved"]
-    print(f"  予約済み: {len(reserved_dates)}日 / 先着予約可能: {len(available_dates)}日")
+    # 土日祝（自動予約対象）は毎回スキャン。平日（通知のみ）は負荷軽減のため初回ループのみ。
+    target_days = list(holidays)
+    if loop_index == 0:
+        target_days += weekdays
+    target_days.sort()
 
-    for d in sorted(available_dates):
-        print(f"  🟢 {d} 先着予約可能")
+    availability = scan_availability(session, target_days)
 
-    # 新たに available になった日を検知
-    new_available = [d for d in available_dates if prev_cal.get(d) != "available"]
+    avail_count = sum(len(v) for v in availability.values())
+    print(f"  空き検知: {len(availability)}日 / {avail_count}枠")
 
-    for d in sorted(new_available):
-        target_date = date.fromisoformat(d)
-        is_holiday = is_weekend_or_holiday(target_date)
-        weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target_date.weekday()]
+    current_avail_keys = set()
+    for date_str in sorted(availability.keys()):
+        slots = availability[date_str]
+        d = date.fromisoformat(date_str)
+        wd = weekday_ja(d)
+        slot_label = "・".join(s["name"] for s in slots)
+        print(f"  🟢 {date_str}（{wd}）空き: {slot_label}")
 
-        # Livewire で利用可能スロットを取得
-        slots = get_available_slots_livewire(session, d)
-        if not slots:
-            print(f"    予約可能なスロットが見つかりません")
-            continue
+        for slot in slots:
+            current_avail_keys.add(f"{date_str}_{slot['time']}")
 
-        if is_holiday:
-            # 土日祝 → 自動予約を実行
-            print(f"\n  🎉 {d}（{weekday_ja}）の空きを検知！土日祝のため自動予約を試みます")
-
-            booked_names = []
+        if is_weekend_or_holiday(d):
+            # 土日祝 → 自動予約
+            booked_names, partial_names = [], []
             for slot in slots:
-                slot_key = f"{d}_{slot['time']}"
+                slot_key = f"{date_str}_{slot['time']}"
                 if slot_key in booked_list:
                     print(f"    [{slot['name']}] 予約済みのためスキップ")
                     continue
-
-                ok = book_slot_livewire(session, d, slot)
-                if ok:
+                outcome = book_slot(session, date_str, slot)
+                if outcome == "booked":
                     booked_list.append(slot_key)
                     booked_names.append(slot["name"])
-
+                elif outcome == "partial":
+                    partial_names.append(slot["name"])
             if booked_names:
-                send_booked_notification(d, booked_names)
+                send_booked_notification(date_str, booked_names)
+            if partial_names:
+                send_partial_notification(date_str, partial_names)
         else:
-            # 平日 → 自動予約せず通知のみ
-            print(f"\n  🟢 {d}（{weekday_ja}）の空きを検知！平日のため通知のみ")
-            slot_names = [s["name"] for s in slots]
-            send_vacancy_notification(d, slot_names)
+            # 平日 → 新規の空きだけ通知（重複通知を防ぐ）
+            new_names = []
+            for slot in slots:
+                slot_key = f"{date_str}_{slot['time']}"
+                if slot_key not in notified_list:
+                    notified_list.append(slot_key)
+                    new_names.append(slot["name"])
+            if new_names:
+                send_vacancy_notification(date_str, new_names)
 
-    # available が埋まった日を検知
-    lost = [d for d, s in prev_cal.items()
-            if s == "available" and calendar.get(d) != "available"]
-    for d in sorted(lost):
-        print(f"  [{d}] 予約が埋まりました。次回空き時に再試行します")
+    # 既に空きが無くなった通知済みキーは解除（次の空きで再通知できるように）
+    notified_list = [k for k in notified_list if k in current_avail_keys]
 
-    return {"calendar": calendar, "booked": booked_list}
+    state["booked"] = booked_list
+    state["notified"] = notified_list
+    return state
 
 
 def main():
-    if not BASE_URL or not FACILITY_ID:
-        print("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID が未設定です")
-        return
-    if not FACILITY_ID_RESERVE:
-        print("⚠️ MIWA_FACILITY_ID_RESERVE が未設定です")
+    if not BASE_URL or not FACILITY_ID_RESERVE:
+        print("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID_RESERVE が未設定です")
         return
 
     print(f"\n{'='*50}")
     print(f"共用施設 空き自動予約：{LOOP_COUNT}回 × {LOOP_INTERVAL_SEC}秒")
-    months = get_months_to_check()
-    print(f"監視期間: {months[0][0]}/{months[0][1]}月 〜 {months[-1][0]}/{months[-1][1]}月")
+    days = get_candidate_dates()
+    print(f"監視期間: {days[0].isoformat()} 〜 {days[-1].isoformat()}")
     print(f"{'='*50}")
 
     session = create_session()
@@ -656,13 +630,11 @@ def main():
         return
 
     state = load_state()
-
     for i in range(LOOP_COUNT):
-        now = datetime.now().strftime("%H:%M:%S")
-        print(f"\n--- チェック {i+1}/{LOOP_COUNT}  ({now}) ---")
-        state = run_once(session, state)
+        now = datetime.now(JST).strftime("%H:%M:%S")
+        print(f"\n--- チェック {i+1}/{LOOP_COUNT}  ({now} JST) ---")
+        state = run_once(session, state, i)
         save_state(state)
-
         if i < LOOP_COUNT - 1:
             print(f"  {LOOP_INTERVAL_SEC}秒後に再チェック...")
             time.sleep(LOOP_INTERVAL_SEC)
