@@ -663,55 +663,59 @@ def finalize_reservation(page, tag: str) -> bool:
 # ============================================================
 # 1枠分の申込
 # ============================================================
+def _select_through_confirm(page, target: date, slot: dict, tag: str) -> str:
+    """施設ページを開く→対象月→日付→枠→オプション→送信 を1回試行する。
+    戻り値: 'confirmed'（確認ページ到達） / 'already'（既に申込/予約あり） / 'failed'。
+    ※失敗時はサイトが利用日をリセットするため、毎回この関数まるごとをやり直す。"""
+    open_facility(page)
+    if not open_calendar(page):
+        log("    ⚠️ カレンダーを開けませんでした")
+        return "failed"
+    if not goto_month(page, target.strftime("%Y-%m")):
+        log("    ⚠️ 対象月へ移動できませんでした")
+        return "failed"
+    if not click_date(page, target):
+        log("    ⚠️ 対象日を選択できませんでした")
+        return "failed"
+    shot(page, f"{tag}_4_date_selected")
+
+    select_slot(page, target, slot["start"])
+    shot(page, f"{tag}_5_slot_selected")
+
+    set_options(page, slot["options"])
+    shot(page, f"{tag}_6_options_set")
+
+    if click_confirm_button(page):
+        return "confirmed"
+
+    # 進めなかった場合、既に予約済み等の判定（無駄な再試行を避ける）
+    body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
+    if any(w in body for w in ("同じ時間に予約", "既に予約", "すでに予約",
+                               "予約済み", "申込済み", "申込み済み")):
+        return "already"
+    return "failed"
+
+
 def apply_slot(page, target: date, slot: dict) -> str:
     """戻り値: 'applied' / 'partial'(未確定) / 'failed'。"""
     name = slot["name"]
     tag = "day" if slot["start"] == "11:00" else "night"
     log(f"\n  [{name}] 申込開始 (date={target})")
 
-    open_facility(page)
-    if not open_calendar(page):
-        log("    ⚠️ カレンダーを開けませんでした")
-        shot(page, f"{tag}_no_calendar")
-        dump_html(page, f"{tag}_no_calendar")
-        return "failed"
-
-    shot(page, f"{tag}_1_calendar_open")
-    dump_html(page, f"{tag}_1_calendar_open")
-
-    if not goto_month(page, target.strftime("%Y-%m")):
-        log("    ⚠️ 対象月へ移動できませんでした")
-        shot(page, f"{tag}_2_month_fail")
-        return "failed"
-
-    if not click_date(page, target):
-        log("    ⚠️ 対象日を選択できませんでした")
-        shot(page, f"{tag}_3_date_fail")
-        return "failed"
-
-    shot(page, f"{tag}_4_date_selected")
-
-    reservable = select_slot(page, target, slot["start"])
-    shot(page, f"{tag}_5_slot_selected")
-    if not reservable:
-        log("    ⚠️ 予約可能な枠ではありませんでした（受付期間外・満枠・既申込の可能性）")
-        # DRY_RUN中は挙動確認のため続行、本番は中断
-        if not DRY_RUN:
-            return "failed"
-
-    # オプション設定→送信を、確認ページに進めるまでリトライ（Livewireの競合対策）。
-    # 失敗してもフォームは残るので、落ち着いた状態で再設定すれば次は通る。
-    advanced = False
+    # 確認ページに到達するまで、最初の日付選択からやり直してリトライ（最大3回）。
+    outcome = "failed"
     for attempt in range(1, 4):
-        set_options(page, slot["options"])
-        shot(page, f"{tag}_6_options_set")
-        if click_confirm_button(page):
-            advanced = True
+        outcome = _select_through_confirm(page, target, slot, tag)
+        if outcome in ("confirmed", "already"):
             break
-        log(f"    確認ページに進めませんでした（試行 {attempt}/3）。再設定して再試行します")
-        page.wait_for_timeout(1200)
-    if not advanced:
-        log("    ⚠️ 「予約内容を確認する」を押せませんでした")
+        log(f"    確認ページに進めませんでした（試行 {attempt}/3）。最初からやり直します")
+        page.wait_for_timeout(1500)
+
+    if outcome == "already":
+        log("    ℹ️ その枠は既に申込/予約済みです（スキップ）")
+        return "applied"
+    if outcome != "confirmed":
+        log("    ⚠️ 確認ページに進めませんでした")
         shot(page, f"{tag}_7_confirm_fail")
         return "failed"
 
