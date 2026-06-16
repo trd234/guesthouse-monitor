@@ -4,19 +4,27 @@ on:
   schedule:
     - cron: '0 1 * * *'     # 毎日 01:00 UTC = 10:00 JST に実行
   workflow_dispatch:         # 手動実行も可能
+    inputs:
+      dry_run:
+        description: '安全モード（1=予約しない/確認まで, 0=本番で確定）'
+        required: false
+        default: '1'
 
 jobs:
   lottery:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: ライブラリインストール
         run: pip install -r requirements.txt
+
+      - name: ブラウザ(Chromium)インストール
+        run: python -m playwright install --with-deps chromium
 
       - name: 抽選自動申込
         run: python miwa_auto_lottery.py
@@ -25,3 +33,14 @@ jobs:
           MIWA_FACILITY_ID_RESERVE: ${{ secrets.MIWA_FACILITY_ID_RESERVE }}
           MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
           MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
+          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
+          # 定期実行(cron)は本番(0)。手動実行のときは入力値、無指定なら安全モード(1)。
+          MIWA_DRY_RUN: ${{ github.event_name == 'schedule' && '0' || (github.event.inputs.dry_run || '1') }}
+
+      - name: スクリーンショット等を保存
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: miwa-screenshots
+          path: artifacts/
+          if-no-files-found: ignore
