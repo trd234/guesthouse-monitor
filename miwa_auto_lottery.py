@@ -376,14 +376,31 @@ def set_livewire_select(page, model: str, value) -> str:
     return "js:" + _js_set_select(page, model, value)
 
 
+def change_select_and_wait(page, model: str, value) -> str:
+    """select を変更し、Livewire 更新通信（/livewire/update）の完了を待つ。
+    通信が起きなければ JS で再発火して再度待つ。"""
+    def is_lw(resp):
+        return "/livewire/update" in resp.url
+    r = "?"
+    try:
+        with page.expect_response(is_lw, timeout=10000):
+            r = set_livewire_select(page, model, value)
+    except PWTimeout:
+        try:
+            with page.expect_response(is_lw, timeout=8000):
+                _js_set_select(page, model, value)
+            r = f"{r}+js"
+        except PWTimeout:
+            r = f"{r}+no-resp"
+    page.wait_for_timeout(400)
+    return r
+
+
 def select_slot(page, target: date, start_label: str) -> bool:
     """親フォームの selectStartDateTime プルダウンを直接設定して枠を選ぶ
-    （タイムラインの子→親伝播を回避）。"""
+    （タイムラインの子→親伝播を回避）。自動選択済みでも必ず明示設定して
+    サーバー側に枠・予約番号を確定登録させる。"""
     want = f"{target.strftime('%Y-%m-%d')} {start_label}"  # 例 '2026-08-15 17:00'
-
-    if get_selected_start(page).startswith(want):
-        log(f"    {start_label} はすでに選択済み（selectStartDateTime一致）")
-        return True
 
     opts = get_select_options(page, "selectStartDateTime")
     log(f"    selectStartDateTime の選択肢: {opts}")
@@ -393,7 +410,14 @@ def select_slot(page, target: date, start_label: str) -> bool:
         log(f"    ⚠️ {start_label} の選択肢が見つかりません")
         return False
 
-    r = set_livewire_select(page, "selectStartDateTime", opt["value"])
+    # すでに目的値の場合でも確実にサーバー登録させるため、
+    # 一旦別の枠を選んでから目的の枠に戻す。
+    if get_selected_start(page).startswith(want):
+        other = next((o for o in opts if o["value"] != opt["value"]), None)
+        if other:
+            change_select_and_wait(page, "selectStartDateTime", other["value"])
+
+    r = change_select_and_wait(page, "selectStartDateTime", opt["value"])
     log(f"    selectStartDateTime = {opt['value']} 設定（{r}）")
 
     # 反映されるまでポーリング（最大約6秒）
@@ -465,29 +489,13 @@ def _js_check_required_boxes(page) -> int:
 
 def set_options(page, options: dict):
     """人数オプション（数量select）を設定する。
-    変更ごとに Livewire 更新通信（/livewire/update）の完了を待ち、確実に登録する。"""
-    def is_lw(resp):
-        return "/livewire/update" in resp.url
-
+    変更ごとに Livewire 更新通信の完了を待ち、確実に登録する。0 の項目は変更しない。"""
     for opt_id, value in options.items():
         if value <= 0:
             continue
         model = f"selectOptionQuantities.{opt_id}"
-        r = "?"
-        try:
-            with page.expect_response(is_lw, timeout=10000):
-                r = set_livewire_select(page, model, value)
-        except PWTimeout:
-            # 通信が起きなければ JS で再発火してもう一度待つ
-            try:
-                with page.expect_response(is_lw, timeout=8000):
-                    _js_set_select(page, model, value)
-                r = f"{r}+js"
-            except PWTimeout:
-                r = f"{r}+no-resp"
-        page.wait_for_timeout(500)
+        r = change_select_and_wait(page, model, value)
         log(f"    option {opt_id} = {value} 設定（{r}, 現在値={get_select_value(page, model)}）")
-
     page.wait_for_timeout(800)
 
 
