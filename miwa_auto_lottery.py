@@ -211,59 +211,50 @@ def open_calendar(page):
     return False
 
 
-def debug_calendar(page):
-    """開いたカレンダーのHTMLをログに出力（月送りボタン・日付セルの形を確認するため）。
-    内部データ(wire:snapshot)に頼らず、実DOMの該当箇所をそのまま出す。"""
-    log(f"    [debug] url={page.url}")
+def dump_region(page, anchor: str, before: int = 400, after: int = 14000, label=""):
+    """実DOMの中から anchor 文字列の周辺HTMLをログに出す（セレクタ確認用）。"""
     body = page.content()
-    log(f"    [debug] body長={len(body)}")
-    for key in ("reserve-calendar", "selectSlot", "次の月", "calendar"):
-        idx = body.find(key)
-        if idx >= 0:
-            window = body[max(0, idx - 800):idx + 6000]
-            window = " ".join(window.split())
-            log(f"    [debug] '{key}' 周辺HTML↓")
-            log(window)
-            return
-    log("    [debug] カレンダー該当箇所が body 内に見つかりません（body先頭4000字↓）")
-    log(" ".join(body.split())[:4000])
+    idx = body.find(anchor)
+    if idx < 0:
+        log(f"    [debug] '{anchor}' は body 内に見つかりません")
+        return
+    window = " ".join(body[max(0, idx - before):idx + after].split())
+    log(f"    [debug] '{anchor}' 周辺HTML{('（'+label+'）') if label else ''}↓")
+    log(window)
 
 
 def current_visible_month(page) -> str:
-    """カレンダー(reserve-calendar)の visibleMonth を読む（例 '2026-06'）。"""
-    for name, data in read_snapshots(page):
-        if "reserve-calendar" in name:
-            return data.get("visibleMonth", "")
+    """カレンダーの表示月を wire:key='reserve-calendar-YYYY-MM' から読む。"""
+    keys = page.evaluate(
+        """() => Array.from(document.querySelectorAll('*'))
+            .map(e => e.getAttribute('wire:key'))
+            .filter(k => k && k.startsWith('reserve-calendar-'))"""
+    )
+    for k in keys or []:
+        m = re.search(r"(\d{4}-\d{2})", k)
+        if m:
+            return m.group(1)
     return ""
 
 
 def goto_month(page, target_month: str, max_clicks: int = 14):
-    """カレンダーを target_month（'YYYY-MM'）まで「次の月」ボタンで進める。"""
+    """カレンダーを target_month（'YYYY-MM'）まで nextMonth で進める。"""
     for _ in range(max_clicks):
         cur = current_visible_month(page)
         log(f"    カレンダー表示月: {cur} / 目標: {target_month}")
         if cur == target_month:
             return True
-        # 「次の月」ボタンの候補をいくつか試す
-        moved = False
-        for sel in [
-            'button[aria-label*="次"]', 'button[aria-label*="next"]',
-            '[wire\\:click*="next"]', '[wire\\:click*="Next"]',
-            '[wire\\:click*="changeMonth"]',
-        ]:
-            loc = page.locator(sel)
-            if loc.count():
-                try:
-                    loc.last.click()
-                    page.wait_for_timeout(700)
-                    moved = True
-                    break
-                except Exception:
-                    continue
-        if not moved:
-            log("    ⚠️ 「次の月」ボタンが見つかりませんでした（カレンダーHTMLを保存）")
-            dump_html(page, "calendar_no_nav")
+        nxt = page.locator('[wire\\:click\\.prevent\\.stop="nextMonth"]')
+        if not nxt.count():
+            log("    ⚠️ nextMonth ボタンが見つかりません（カレンダーHTML↓）")
+            dump_region(page, "reserve-calendar")
             return False
+        try:
+            nxt.first.click()
+        except Exception as e:
+            log(f"    ⚠️ nextMonth クリック失敗: {e}")
+            return False
+        page.wait_for_timeout(900)
     return current_visible_month(page) == target_month
 
 
@@ -271,33 +262,46 @@ def click_date(page, target: date) -> bool:
     """カレンダー上で対象日のセルをクリックする。"""
     day = target.day
     iso = target.strftime("%Y-%m-%d")
-    # 候補: wire:click に日付が入っているセル / 日付テキストのセル
-    candidates = [
+    # 対象月の日付セルの形を確認するためダンプ
+    dump_region(page, f"reserve-calendar-{target.strftime('%Y-%m')}",
+                before=100, after=14000, label="対象月カレンダー")
+    # 候補: wire:click に日付が入っているセル / wire:key に日付
+    for sel in [
         f'[wire\\:click*="{iso}"]',
         f'[wire\\:key*="{iso}"]',
-    ]
-    for sel in candidates:
+        f'[wire\\:click*="selectDate(\'{iso}\')"]',
+    ]:
         loc = page.locator(sel)
         if loc.count():
-            loc.first.click()
-            page.wait_for_timeout(1200)
-            return True
-    # テキスト（日にち数字）でクリック。カレンダー内の該当セルを探す。
-    cells = page.locator('[wire\\:key^="reserve-calendar-"] >> text=' + str(day))
-    if cells.count():
-        cells.first.click()
-        page.wait_for_timeout(1200)
-        return True
-    log("    ⚠️ 対象日のセルが特定できませんでした（カレンダーHTMLを保存）")
-    dump_html(page, "calendar_date_notfound")
+            try:
+                loc.first.click()
+                page.wait_for_timeout(1300)
+                return True
+            except Exception as e:
+                log(f"    （{sel} クリック失敗: {e}）")
+    # カレンダーポップアップ内で、日にち数字のクリック可能セルを探す
+    cal = page.locator('[wire\\:key^="reserve-calendar-"]')
+    if cal.count():
+        cell = cal.first.get_by_text(re.compile(rf"^\s*{day}\s*$"))
+        if cell.count():
+            try:
+                cell.first.click()
+                page.wait_for_timeout(1300)
+                return True
+            except Exception as e:
+                log(f"    （日付テキストクリック失敗: {e}）")
+    log("    ⚠️ 対象日のセルが特定できませんでした")
     return False
 
 
 def select_slot(page, start_label: str) -> bool:
     """タイムラインから start_label（'11:00'/'17:00'）の枠を選んでクリックする。"""
     slots = get_timeline_slots(page)
-    log(f"    タイムライン枠: " + ", ".join(
-        f"[{s['index']}]{s['start']}-{s['end']}({s['status']})" for s in slots) or "（枠なし）")
+    log("    タイムライン枠: " + (", ".join(
+        f"[{s['index']}]{s['start']}-{s['end']}({s['status']})" for s in slots) or "（枠なし）"))
+    if not slots:
+        # 内部データが読めない場合に備え、タイムラインのHTMLを出して枠の形を確認する
+        dump_region(page, "selectSlot", before=600, after=12000, label="タイムライン")
     # まず予約可かつ開始時刻一致の枠
     target = None
     for s in slots:
@@ -403,7 +407,6 @@ def apply_slot(page, target: date, slot: dict) -> str:
 
     shot(page, f"{tag}_1_calendar_open")
     dump_html(page, f"{tag}_1_calendar_open")
-    debug_calendar(page)
 
     if not goto_month(page, target.strftime("%Y-%m")):
         log("    ⚠️ 対象月へ移動できませんでした")
