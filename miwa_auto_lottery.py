@@ -464,24 +464,31 @@ def _js_check_required_boxes(page) -> int:
 
 
 def set_options(page, options: dict):
-    """人数オプション（数量select）を設定する。"""
-    # 数量をセット（実操作優先・不可ならJS）。0 の項目は変更しない。
+    """人数オプション（数量select）を設定する。
+    変更ごとに Livewire 更新通信（/livewire/update）の完了を待ち、確実に登録する。"""
+    def is_lw(resp):
+        return "/livewire/update" in resp.url
+
     for opt_id, value in options.items():
         if value <= 0:
             continue
-        r = set_livewire_select(page, f"selectOptionQuantities.{opt_id}", value)
-        log(f"    option {opt_id} = {value} 設定（{r}）")
+        model = f"selectOptionQuantities.{opt_id}"
+        r = "?"
         try:
-            page.wait_for_load_state("networkidle", timeout=8000)
+            with page.expect_response(is_lw, timeout=10000):
+                r = set_livewire_select(page, model, value)
         except PWTimeout:
-            pass
-        page.wait_for_timeout(400)
+            # 通信が起きなければ JS で再発火してもう一度待つ
+            try:
+                with page.expect_response(is_lw, timeout=8000):
+                    _js_set_select(page, model, value)
+                r = f"{r}+js"
+            except PWTimeout:
+                r = f"{r}+no-resp"
+        page.wait_for_timeout(500)
+        log(f"    option {opt_id} = {value} 設定（{r}, 現在値={get_select_value(page, model)}）")
 
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(600)
+    page.wait_for_timeout(800)
 
 
 def debug_buttons(page, label=""):
