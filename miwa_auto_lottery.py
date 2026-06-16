@@ -535,6 +535,17 @@ def click_confirm_button(page) -> bool:
     still_form = page.locator('button:has-text("予約内容を確認する")').count() > 0
     advanced = (not still_form) or ("reserve-confirm" in page.url)
     log(f"    送信後: URL={page.url}（変化={page.url != before}） 確認ページ到達={advanced}")
+    if not advanced:
+        # 進めなかった理由（バリデーションエラー等）を画面から拾う
+        try:
+            body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
+            hits = [w for w in ("既に", "すでに", "済み", "重複", "できません",
+                                "上限", "制限", "選択してください", "必須", "エラー")
+                    if w in body]
+            log(f"    [debug] 進めない理由の手掛かり: {hits}")
+            log(f"    [debug] 画面テキスト（先頭700字）: {body[:700]}")
+        except Exception as e:
+            log(f"    （理由テキスト取得失敗: {e}）")
     return advanced
 
 
