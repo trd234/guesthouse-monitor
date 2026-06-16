@@ -601,41 +601,63 @@ def finalize_reservation(page, tag: str) -> bool:
         })""")
     page.wait_for_timeout(600)
 
-    # 「抽選予約する」を押す（ボタン＋フォーム submit=reserve をJSでも発火）
+    # 「抽選予約する」を1回だけ送信する。
+    # ※ボタンクリックとJS送信を両方やると、1回目で成立→2回目が「同じ時間に予約」
+    #   という自己重複エラーになるため、必ず単一の送信にする。
     loc = page.locator('button:has-text("抽選予約する")')
+    submitted = False
     if loc.count():
         try:
             loc.first.click(force=True)
+            submitted = True
+            log("    抽選予約 送信: ボタンクリック")
         except Exception as e:
             log(f"    （抽選予約するボタンのクリック失敗: {e}）")
-    res = page.evaluate(
-        """() => {
-            const f = Array.from(document.querySelectorAll('form')).find(e =>
-                e.getAttributeNames().some(n => n.startsWith('wire:submit')));
-            if (!f) return 'no-form';
-            if (f.requestSubmit) f.requestSubmit(); else
-                f.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
-            return 'submitted';
-        }""")
-    log(f"    抽選予約 送信: {res}")
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(2000)
+    if not submitted:
+        res = page.evaluate(
+            """() => {
+                const f = Array.from(document.querySelectorAll('form')).find(e =>
+                    e.getAttributeNames().some(n => n.startsWith('wire:submit')));
+                if (!f) return 'no-form';
+                if (f.requestSubmit) f.requestSubmit(); else
+                    f.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+                return 'submitted';
+            }""")
+        log(f"    抽選予約 送信: フォーム送信({res})")
+
+    # 完了（抽選待ち画面）になるまで、または重複/エラーが出るまでポーリング
+    done = False
+    duplicate = False
+    body = ""
+    for _ in range(12):
+        try:
+            page.wait_for_load_state("networkidle", timeout=4000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(700)
+        body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
+        url = page.url
+        if any(k in body for k in DONE_KEYWORDS) or re.search(r"/reserves/\d+", url) \
+                or ("reserve-confirm" not in url and "/facilities/" in url):
+            done = True
+            break
+        if any(w in body for w in ("同じ時間に予約", "既に予約", "すでに予約")):
+            duplicate = True
+            break
 
     shot(page, f"{tag}_9_after_reserve")
     dump_html(page, f"{tag}_9_after_reserve")
-    body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
     log(f"    確定後 URL={page.url}")
-    log(f"    確定後テキスト（先頭600字）: {body[:600]}")
 
-    done = any(k in body for k in DONE_KEYWORDS) or bool(re.search(r"/reserves/\d+", page.url))
     if done:
         log("    ✅ 申込完了（抽選待ち）を確認")
-    else:
-        log("    ⚠️ 完了の確認文言が見つかりませんでした（要確認）")
-    return done
+        return True
+    if duplicate:
+        # その日時はすでに申込済み＝予約は存在する
+        log("    ℹ️ 同じ時間に既に予約あり（申込済みとして扱う）")
+        return True
+    log(f"    ⚠️ 完了を確認できませんでした。画面テキスト（先頭800字）: {body[:800]}")
+    return False
 
 
 # ============================================================
