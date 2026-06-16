@@ -396,10 +396,27 @@ def change_select_and_wait(page, model: str, value) -> str:
     return r
 
 
+def _settle_after_select(page, want: str) -> bool:
+    """selectStartDateTime が want になり、画面が安定するまで待つ（最大約6秒）。"""
+    ok = False
+    for _ in range(8):
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(500)
+        if get_selected_start(page).startswith(want):
+            ok = True
+            break
+    # 反映後さらに少し待って再描画を確定させる
+    page.wait_for_timeout(800)
+    return ok
+
+
 def select_slot(page, target: date, start_label: str) -> bool:
     """親フォームの selectStartDateTime プルダウンを直接設定して枠を選ぶ
     （タイムラインの子→親伝播を回避）。自動選択済みでも必ず明示設定して
-    サーバー側に枠・予約番号を確定登録させる。"""
+    サーバー側に枠・予約番号を確定登録させ、再描画が安定するまで待つ。"""
     want = f"{target.strftime('%Y-%m-%d')} {start_label}"  # 例 '2026-08-15 17:00'
 
     opts = get_select_options(page, "selectStartDateTime")
@@ -410,26 +427,19 @@ def select_slot(page, target: date, start_label: str) -> bool:
         log(f"    ⚠️ {start_label} の選択肢が見つかりません")
         return False
 
-    # すでに目的値の場合でも確実にサーバー登録させるため、
-    # 一旦別の枠を選んでから目的の枠に戻す。
+    # すでに目的値の場合でも確実にサーバー登録させるため、一旦別の枠を選んでから戻す。
     if get_selected_start(page).startswith(want):
         other = next((o for o in opts if o["value"] != opt["value"]), None)
         if other:
-            change_select_and_wait(page, "selectStartDateTime", other["value"])
+            set_livewire_select(page, "selectStartDateTime", other["value"])
+            _settle_after_select(page, other["value"][:16])
 
-    r = change_select_and_wait(page, "selectStartDateTime", opt["value"])
+    r = set_livewire_select(page, "selectStartDateTime", opt["value"])
     log(f"    selectStartDateTime = {opt['value']} 設定（{r}）")
 
-    # 反映されるまでポーリング（最大約6秒）
-    for _ in range(8):
-        try:
-            page.wait_for_load_state("networkidle", timeout=3000)
-        except PWTimeout:
-            pass
-        page.wait_for_timeout(500)
-        if get_selected_start(page).startswith(want):
-            log(f"    選択OK selectReserveNumber={get_select_value(page, 'selectReserveNumber')}")
-            return True
+    if _settle_after_select(page, want):
+        log(f"    選択OK selectReserveNumber={get_select_value(page, 'selectReserveNumber')}")
+        return True
     log(f"    ⚠️ selectStartDateTime が {want} になりませんでした"
         f"（現在: {get_selected_start(page)}）")
     return False
