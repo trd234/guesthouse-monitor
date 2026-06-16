@@ -498,14 +498,13 @@ def _js_check_required_boxes(page) -> int:
 
 
 def set_options(page, options: dict):
-    """人数オプション（数量select）を設定する。0 の項目は変更しない。
-    枠選択直後の再描画で最初の1回が取りこぼされることがあるため、2パスで確実に登録する。"""
-    targets = {opt_id: value for opt_id, value in options.items() if value > 0}
-    for pass_no in (1, 2):
-        for opt_id, value in targets.items():
-            model = f"selectOptionQuantities.{opt_id}"
-            r = change_select_and_wait(page, model, value)
-            log(f"    option {opt_id} = {value} 設定[{pass_no}]（{r}, 現在値={get_select_value(page, model)}）")
+    """人数オプション（数量select）を設定する。0 の項目は変更しない。"""
+    for opt_id, value in options.items():
+        if value <= 0:
+            continue
+        model = f"selectOptionQuantities.{opt_id}"
+        r = change_select_and_wait(page, model, value)
+        log(f"    option {opt_id} = {value} 設定（{r}, 現在値={get_select_value(page, model)}）")
     page.wait_for_timeout(800)
 
 
@@ -678,10 +677,18 @@ def apply_slot(page, target: date, slot: dict) -> str:
         if not DRY_RUN:
             return "failed"
 
-    set_options(page, slot["options"])
-    shot(page, f"{tag}_6_options_set")
-
-    if not click_confirm_button(page):
+    # オプション設定→送信を、確認ページに進めるまでリトライ（Livewireの競合対策）。
+    # 失敗してもフォームは残るので、落ち着いた状態で再設定すれば次は通る。
+    advanced = False
+    for attempt in range(1, 4):
+        set_options(page, slot["options"])
+        shot(page, f"{tag}_6_options_set")
+        if click_confirm_button(page):
+            advanced = True
+            break
+        log(f"    確認ページに進めませんでした（試行 {attempt}/3）。再設定して再試行します")
+        page.wait_for_timeout(1200)
+    if not advanced:
         log("    ⚠️ 「予約内容を確認する」を押せませんでした")
         shot(page, f"{tag}_7_confirm_fail")
         return "failed"
