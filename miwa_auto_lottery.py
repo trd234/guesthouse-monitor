@@ -320,15 +320,18 @@ def click_date(page, target: date) -> bool:
     return False
 
 
-def _js_click_slot(page, idx: int) -> bool:
-    """slot-{idx} の要素を JS で直接クリックする（重なり要素による妨害を回避）。"""
-    return bool(page.evaluate(
+def _js_click_slot(page, idx: int) -> str:
+    """slot-{idx} の要素へ MouseEvent を直接 dispatch する（重なり要素の妨害を回避）。"""
+    return page.evaluate(
         """(idx) => {
             const el = Array.from(document.querySelectorAll('*'))
                 .find(e => e.getAttribute('wire:key') === 'slot-' + idx);
-            if (el) { el.click(); return true; }
-            return false;
-        }""", idx))
+            if (!el) return 'no-el';
+            el.scrollIntoView({block: 'center'});
+            el.dispatchEvent(new MouseEvent('click',
+                {bubbles: true, cancelable: true, view: window}));
+            return 'clicked';
+        }""", idx)
 
 
 def select_slot(page, target: date, start_label: str) -> bool:
@@ -357,13 +360,20 @@ def select_slot(page, target: date, start_label: str) -> bool:
         return False
     idx = clickable[0]["index"]
     log(f"    枠 index={idx}（{clickable[0]['title']}）をクリック")
-    if idx is None or not _js_click_slot(page, idx):
-        log(f"    ⚠️ slot-{idx} をクリックできませんでした")
+    if idx is None:
         return False
+    result = _js_click_slot(page, idx)
+    log(f"    （クリック結果: {result}）")
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except PWTimeout:
+        pass
     page.wait_for_timeout(1200)
 
     # 選択中に変わったか確認
     slots2 = get_timeline_slots(page)
+    log("    クリック後の枠: " + (", ".join(
+        f"[{s['index']}]{s['start']}({s['status']})" for s in slots2) or "（枠なし）"))
     selected = any(s["date"] == date_slash and s["start"] == start_label
                    and s["status"] == "選択中" for s in slots2)
     if not selected:
@@ -501,6 +511,11 @@ def apply_slot(page, target: date, slot: dict) -> str:
     dump_html(page, f"{tag}_8_confirm_page")
     log(f"    確認ページURL: {page.url}")
     debug_buttons(page, label="確認ページ")
+    try:
+        txt = " ".join((page.evaluate("() => document.body.innerText") or "").split())
+        log(f"    [debug] 確認ページの画面テキスト（先頭2500字）↓\n{txt[:2500]}")
+    except Exception as e:
+        log(f"    （画面テキスト取得失敗: {e}）")
 
     ok = finalize_reservation(page)
     if ok:
