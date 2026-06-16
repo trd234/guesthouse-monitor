@@ -320,32 +320,55 @@ def click_date(page, target: date) -> bool:
     return False
 
 
+def _js_click_slot(page, idx: int) -> bool:
+    """slot-{idx} の要素を JS で直接クリックする（重なり要素による妨害を回避）。"""
+    return bool(page.evaluate(
+        """(idx) => {
+            const el = Array.from(document.querySelectorAll('*'))
+                .find(e => e.getAttribute('wire:key') === 'slot-' + idx);
+            if (el) { el.click(); return true; }
+            return false;
+        }""", idx))
+
+
 def select_slot(page, target: date, start_label: str) -> bool:
-    """タイムラインから対象日・start_label（'11:00'/'17:00'）の枠を選んでクリックする。"""
+    """タイムラインから対象日・start_label（'11:00'/'17:00'）の枠を選択する。
+    すでに『選択中』ならクリック不要。必要ならJSで直接クリックして選択する。"""
     date_slash = target.strftime("%Y/%m/%d")
     slots = get_timeline_slots(page)
     log("    タイムライン枠: " + (", ".join(
         f"[{s['index']}]{s['date']} {s['start']}({s['status']})" for s in slots) or "（枠なし）"))
 
-    # 対象日・開始時刻が一致する枠
-    cand = [s for s in slots if s["date"] == date_slash and s["start"] == start_label]
-    if not cand:
+    matches = [s for s in slots if s["date"] == date_slash and s["start"] == start_label]
+    if not matches:
         log(f"    ⚠️ {date_slash} {start_label} の枠が見つかりません"
             f"（タイムラインが対象日に切り替わっていない可能性）")
         return False
-    target_slot = cand[0]
-    reservable = target_slot["status"] == "予約可"
-    idx = target_slot["index"]
-    log(f"    枠 index={idx}（{target_slot['title']}）を選択")
-    if idx is None:
+
+    # すでに選択中ならOK
+    if any(s["status"] == "選択中" for s in matches):
+        log(f"    {start_label} はすでに『選択中』です（クリック不要）")
+        return True
+
+    # 予約可の枠をJSで直接クリック
+    clickable = [s for s in matches if s["status"] == "予約可"]
+    if not clickable:
+        log(f"    ⚠️ {start_label} は予約可ではありません（状態: {[s['status'] for s in matches]}）")
         return False
-    loc = page.locator(f'[wire\\:key="slot-{idx}"]')
-    if not loc.count():
-        log(f"    ⚠️ slot-{idx} の要素が見つかりません")
+    idx = clickable[0]["index"]
+    log(f"    枠 index={idx}（{clickable[0]['title']}）をクリック")
+    if idx is None or not _js_click_slot(page, idx):
+        log(f"    ⚠️ slot-{idx} をクリックできませんでした")
         return False
-    loc.first.click()
-    page.wait_for_timeout(1000)
-    return reservable
+    page.wait_for_timeout(1200)
+
+    # 選択中に変わったか確認
+    slots2 = get_timeline_slots(page)
+    selected = any(s["date"] == date_slash and s["start"] == start_label
+                   and s["status"] == "選択中" for s in slots2)
+    if not selected:
+        log("    ⚠️ クリック後も『選択中』になりませんでした")
+    return selected
 
 
 def set_options(page, options: dict):
@@ -362,6 +385,24 @@ def set_options(page, options: dict):
                 log(f"    ⚠️ option {opt_id} 設定失敗: {e}")
         else:
             log(f"    ⚠️ option {opt_id} の select が見つかりません")
+
+
+def debug_buttons(page, label=""):
+    """画面上のボタン/フォームの文字と wire: 属性を一覧表示（確定ボタン特定用）。"""
+    items = page.evaluate(
+        """() => Array.from(document.querySelectorAll('button, form'))
+            .map(e => {
+                const w = {};
+                e.getAttributeNames().filter(n => n.startsWith('wire:'))
+                    .forEach(n => w[n] = e.getAttribute(n));
+                return { tag: e.tagName,
+                         text: (e.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40),
+                         wire: w };
+            }).slice(0, 40)"""
+    )
+    log(f"    [debug] ボタン/フォーム一覧{('（'+label+'）') if label else ''}（{len(items or [])}件）↓")
+    for it in items or []:
+        log(f"      <{it['tag']}> text={it['text']!r} wire={it['wire']}")
 
 
 def click_confirm_button(page) -> bool:
@@ -459,6 +500,7 @@ def apply_slot(page, target: date, slot: dict) -> str:
     shot(page, f"{tag}_8_confirm_page")
     dump_html(page, f"{tag}_8_confirm_page")
     log(f"    確認ページURL: {page.url}")
+    debug_buttons(page, label="確認ページ")
 
     ok = finalize_reservation(page)
     if ok:
