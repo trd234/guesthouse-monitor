@@ -334,10 +334,21 @@ def _js_click_slot(page, idx: int) -> str:
         }""", idx)
 
 
+def get_selected_start(page) -> str:
+    """親フォームの selectStartDateTime（選択中の開始日時）を読む。例 '2026-08-15 11:00:00'。"""
+    return page.evaluate(
+        """() => {
+            const el = Array.from(document.querySelectorAll('select'))
+                .find(e => e.getAttribute('wire:model.change') === 'selectStartDateTime');
+            return el ? el.value : '';
+        }""") or ""
+
+
 def select_slot(page, target: date, start_label: str) -> bool:
     """タイムラインから対象日・start_label（'11:00'/'17:00'）の枠を選択する。
-    すでに『選択中』ならクリック不要。必要ならJSで直接クリックして選択する。"""
+    selectStartDateTime で確定状態を確認する（実マウスクリックで selectSlot を発火）。"""
     date_slash = target.strftime("%Y/%m/%d")
+    want = f"{target.strftime('%Y-%m-%d')} {start_label}"  # 例 '2026-08-15 17:00'
     slots = get_timeline_slots(page)
     log("    タイムライン枠: " + (", ".join(
         f"[{s['index']}]{s['date']} {s['start']}({s['status']})" for s in slots) or "（枠なし）"))
@@ -348,37 +359,39 @@ def select_slot(page, target: date, start_label: str) -> bool:
             f"（タイムラインが対象日に切り替わっていない可能性）")
         return False
 
-    # すでに選択中ならOK
-    if any(s["status"] == "選択中" for s in matches):
-        log(f"    {start_label} はすでに『選択中』です（クリック不要）")
+    # すでに目的の時刻が選択済みか（昼枠は自動選択されている）
+    if get_selected_start(page).startswith(want):
+        log(f"    {start_label} はすでに選択済み（selectStartDateTime一致）")
         return True
 
-    # 予約可の枠をJSで直接クリック
-    clickable = [s for s in matches if s["status"] == "予約可"]
+    # 予約可（または選択中）の枠を実マウスクリック（force=Trueで重なりを無視）
+    clickable = [s for s in matches if s["status"] in ("予約可", "選択中")]
     if not clickable:
         log(f"    ⚠️ {start_label} は予約可ではありません（状態: {[s['status'] for s in matches]}）")
         return False
     idx = clickable[0]["index"]
     log(f"    枠 index={idx}（{clickable[0]['title']}）をクリック")
-    if idx is None:
+    loc = page.locator(f'[wire\\:key="slot-{idx}"]')
+    if not loc.count():
+        log(f"    ⚠️ slot-{idx} の要素が見つかりません")
         return False
-    result = _js_click_slot(page, idx)
-    log(f"    （クリック結果: {result}）")
+    try:
+        loc.first.click(force=True)
+    except Exception as e:
+        log(f"    ⚠️ slot-{idx} クリック失敗: {e}")
+        return False
     try:
         page.wait_for_load_state("networkidle", timeout=15000)
     except PWTimeout:
         pass
     page.wait_for_timeout(1200)
 
-    # 選択中に変わったか確認
-    slots2 = get_timeline_slots(page)
-    log("    クリック後の枠: " + (", ".join(
-        f"[{s['index']}]{s['start']}({s['status']})" for s in slots2) or "（枠なし）"))
-    selected = any(s["date"] == date_slash and s["start"] == start_label
-                   and s["status"] == "選択中" for s in slots2)
-    if not selected:
-        log("    ⚠️ クリック後も『選択中』になりませんでした")
-    return selected
+    sel = get_selected_start(page)
+    log(f"    クリック後 selectStartDateTime={sel}")
+    if not sel.startswith(want):
+        log("    ⚠️ 目的の時刻が選択されませんでした")
+        return False
+    return True
 
 
 def debug_options(page):
@@ -401,21 +414,62 @@ def debug_options(page):
             f"wire={it['wire']} near={it['near']!r}")
 
 
+def _js_set_select(page, model: str, value) -> str:
+    """wire:model.change=model の select に値をセットし、input/change を発火させる。"""
+    return page.evaluate(
+        """([model, value]) => {
+            const el = Array.from(document.querySelectorAll('select'))
+                .find(e => e.getAttribute('wire:model.change') === model);
+            if (!el) return 'no-el';
+            el.value = String(value);
+            el.dispatchEvent(new Event('input', {bubbles: true}));
+            el.dispatchEvent(new Event('change', {bubbles: true}));
+            return el.value;
+        }""", [model, value])
+
+
+def _js_check_required_boxes(page) -> int:
+    """『項目左側の✓』に相当する type=checkbox（hidden/token以外）を全てONにする。"""
+    return page.evaluate(
+        """() => {
+            const boxes = Array.from(document.querySelectorAll('input[type=checkbox]'));
+            let n = 0;
+            boxes.forEach(b => {
+                if (!b.checked) {
+                    b.checked = true;
+                    b.dispatchEvent(new Event('input', {bubbles: true}));
+                    b.dispatchEvent(new Event('change', {bubbles: true}));
+                    n++;
+                }
+            });
+            return n;
+        }""")
+
+
 def set_options(page, options: dict):
-    """人数オプションの select を設定する。"""
+    """人数オプション（数量select）を設定し、必須の✓チェックボックスをONにする。"""
+    # 構造確認のためオプション欄のHTMLを出す
+    dump_region(page, "21時までの利用人数", before=200, after=4500, label="オプション欄")
     debug_options(page)
+
+    # 必須の✓チェックボックスをON
+    n = _js_check_required_boxes(page)
+    log(f"    チェックボックスをON: {n}件")
+
+    # 数量を JS でセット（input/change を確実に発火）。0 の項目は変更しない。
     for opt_id, value in options.items():
-        sel = f'select[wire\\:model\\.change="selectOptionQuantities.{opt_id}"]'
-        loc = page.locator(sel)
-        if loc.count():
-            try:
-                loc.first.select_option(str(value))
-                page.wait_for_timeout(500)
-                log(f"    option {opt_id} = {value} 設定")
-            except Exception as e:
-                log(f"    ⚠️ option {opt_id} 設定失敗: {e}")
-        else:
-            log(f"    ⚠️ option {opt_id} の select が見つかりません")
+        if value <= 0:
+            continue
+        r = _js_set_select(page, f"selectOptionQuantities.{opt_id}", value)
+        log(f"    option {opt_id} = {value} 設定（結果={r}）")
+        page.wait_for_timeout(400)
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(600)
+    debug_options(page)  # 設定後の状態を確認
 
 
 def debug_buttons(page, label=""):
