@@ -212,30 +212,21 @@ def open_calendar(page):
 
 
 def debug_calendar(page):
-    """開いたカレンダーの構造をログに出力（月送りボタン・日付セルの形を確認するため）。"""
-    snaps = read_snapshots(page)
-    log(f"    [debug] snapshot数={len(snaps)} names={[n for n, _ in snaps]}")
-    # reserve-calendar コンポーネントの outerHTML を取り出す
-    outer = page.evaluate(
-        """() => {
-            const els = Array.from(document.querySelectorAll('*'))
-                .filter(e => e.hasAttribute('wire:snapshot'));
-            for (const e of els) {
-                try {
-                    const d = JSON.parse(e.getAttribute('wire:snapshot'));
-                    if (((d.memo && d.memo.name) || '').includes('reserve-calendar'))
-                        return e.outerHTML;
-                } catch (x) {}
-            }
-            return '';
-        }"""
-    )
-    if outer:
-        snippet = " ".join(outer.split())[:6000]
-        log("    [debug] reserve-calendar outerHTML（先頭6000字）↓")
-        log(snippet)
-    else:
-        log("    [debug] reserve-calendar 要素が見つかりません")
+    """開いたカレンダーのHTMLをログに出力（月送りボタン・日付セルの形を確認するため）。
+    内部データ(wire:snapshot)に頼らず、実DOMの該当箇所をそのまま出す。"""
+    log(f"    [debug] url={page.url}")
+    body = page.content()
+    log(f"    [debug] body長={len(body)}")
+    for key in ("reserve-calendar", "selectSlot", "次の月", "calendar"):
+        idx = body.find(key)
+        if idx >= 0:
+            window = body[max(0, idx - 800):idx + 6000]
+            window = " ".join(window.split())
+            log(f"    [debug] '{key}' 周辺HTML↓")
+            log(window)
+            return
+    log("    [debug] カレンダー該当箇所が body 内に見つかりません（body先頭4000字↓）")
+    log(" ".join(body.split())[:4000])
 
 
 def current_visible_month(page) -> str:
