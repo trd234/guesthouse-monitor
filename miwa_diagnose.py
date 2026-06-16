@@ -311,71 +311,205 @@ def is_weekend_or_holiday(d):
     return False
 
 
-def reproduce_date_selection(session):
-    """本番と同じ流れで『日付を選択した直後』までを再現し、
-    サイトが返す再描画HTMLとデータ構造を丸ごと出力する。
-    確定系メソッド（next/apply/reserve 等）は一切呼ばないので予約は発生しない。"""
-    line("★ 日付選択後の構造を診断（予約はしない）")
+# ------------------------------------------------------------
+# Livewire データ構造のヘルパー（タイムライン枠の解析用）
+# ------------------------------------------------------------
+def _unwrap_arr(v):
+    """Livewire の [値, {"s":"arr"}] / [値, {"s":"..."}] ラッパーを外す。"""
+    if isinstance(v, list) and len(v) == 2 and isinstance(v[1], dict) and "s" in v[1]:
+        return v[0]
+    return v
 
-    # 本番と同じ対象日（60日後）。土日祝でなくても、構造確認のため選択は試す。
-    target = date.today() + timedelta(days=DAYS_AHEAD)
-    weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target.weekday()]
-    date_str = target.strftime("%Y-%m-%d")
-    print(f"  対象日: {date_str}（{weekday_ja}） 土日祝={is_weekend_or_holiday(target)}")
 
-    snap_str, xsrf = extract_facility_snapshot(session)
-    if not snap_str:
-        print("  → 施設スナップショットが取れないため中断")
-        return
+def _status_str(reservable_status):
+    """reservableStatus（["reserved",{enm}] 形式 or 文字列）から状態文字列を取り出す。"""
+    rs = _unwrap_arr(reservable_status)
+    if isinstance(rs, str):
+        return rs
+    if isinstance(reservable_status, list) and reservable_status and isinstance(reservable_status[0], str):
+        return reservable_status[0]
+    return str(reservable_status)
 
-    init_data = json.loads(snap_str)["data"]
-    dump_data_full(init_data, "【選択前】施設ページ初期")
 
-    print(f"\n  → selectStartDate = {date_str} を送信（updates のみ・確定なし）")
+def _carbon_str(v):
+    v = _unwrap_arr(v)
+    if isinstance(v, str):
+        return v
+    if isinstance(v, list) and v and isinstance(v[0], str):
+        return v[0]
+    return None
+
+
+def extract_snapshots_from_html(text):
+    """HTML文字列中の全 wire:snapshot を取り出し、[(name, snap_str, data), ...] を返す。"""
+    out = []
+    for s in re.findall(r'wire:snapshot="((?:&[^;]+;|[^"])+)"', text):
+        decoded = html.unescape(s)
+        try:
+            d = json.loads(decoded)
+        except json.JSONDecodeError:
+            continue
+        name = d.get("memo", {}).get("name", "")
+        out.append((name, decoded, d.get("data", {})))
+    return out
+
+
+def dump_timeline_slots(timeline_data, label="タイムライン枠"):
+    """reserve-timeline の computed（枠リスト）を index/start/end/状態 で一覧表示し、
+    予約可（reservable）な枠の index リストを返す。"""
+    print(f"\n--- {label}（computed）---")
+    reservable_indexes = []
+    computed = _unwrap_arr(timeline_data.get("computed", []))
+    if not isinstance(computed, list) or not computed:
+        print("  （computed が空。＝この日付の枠が読み込まれていない可能性）")
+        return reservable_indexes
+    for raw_slot in computed:
+        slot = _unwrap_arr(raw_slot)
+        if not isinstance(slot, dict):
+            continue
+        idx = slot.get("index")
+        start = slot.get("start") or _carbon_str(slot.get("orig_start"))
+        end = slot.get("end") or _carbon_str(slot.get("orig_end"))
+        status = _status_str(slot.get("reservableStatus"))
+        kbn = slot.get("reserveKbn")
+        mark = "  ★予約可" if status == "reservable" else ""
+        print(f"  index={idx}  {start}〜{end}  status={status}  reserveKbn={kbn}{mark}")
+        if status == "reservable":
+            reservable_indexes.append(idx)
+    return reservable_indexes
+
+
+def get_timeline_snapshot(html_text):
+    """再描画HTMLから reserve-timeline コンポーネントの (snap_str, data) を取り出す。"""
+    for name, snap, data in extract_snapshots_from_html(html_text):
+        if "reserve-timeline" in name:
+            return snap, data
+    return None, None
+
+
+def diagnose_slot_flow(session, snap_str, xsrf, date_str, weekday_ja, label):
+    """指定日を選択 → タイムライン枠を一覧 → 予約可枠を selectSlot で選んでみて、
+    サイトが返すやり取り（dispatches / 親へ渡す値）を観察する。確定はしない。"""
+    line(f"▼ {label}: {date_str}（{weekday_ja}）の枠を診断")
+
+    # 対象月をカレンダーに読み込ませるため visibleMonth も一緒に送る
+    target_month = date_str[:7]
+    print(f"  → updates: visibleMonth={target_month}, selectStartDate={date_str}（確定なし）")
     snap2, data2, effects2 = livewire_call(
-        session, snap_str, xsrf, updates={"selectStartDate": date_str})
+        session, snap_str, xsrf,
+        updates={"visibleMonth": target_month, "selectStartDate": date_str})
     if snap2 is None:
         print("  → 日付選択の Livewire 呼び出しが失敗。上のエラーを参照。")
         return
 
-    # 1) 選択後のデータ構造を全部
-    dump_data_full(data2, "【選択後】data 全項目")
+    # 親側の重要項目
+    print("\n--- 親(facility-detail) 選択後の重要項目 ---")
+    for key in ("selectStartDate", "selectStartDateTime", "selectReserveNumber",
+                "reserveKbn", "reservableStatus", "displayStartDateTime",
+                "displayReserveNumber", "reserveCost"):
+        val = data2.get(key) if isinstance(data2, dict) else None
+        print(f"  {key} = {json.dumps(val, ensure_ascii=False)[:200]}")
 
-    # 2) reserveKbn / startDateTimes を名指しで確認
-    print("\n--- 重要項目の中身（選択後） ---")
-    for key in ("reserveKbn", "startDateTimes", "selectStartDate",
-                "selectStartDateTime", "selectReserveNumber",
-                "selectOptionQuantities", "options"):
-        if isinstance(data2, dict) and key in data2:
-            print(f"  {key} = {json.dumps(data2.get(key), ensure_ascii=False)[:400]}")
-        else:
-            print(f"  {key} = （キーなし）")
+    html_eff = effects2.get("html", "") if isinstance(effects2, dict) else ""
+    if not html_eff:
+        print("  （effects.html なし。枠の解析ができません）")
+        return
 
-    # 3) effects（再描画HTML・redirect・errors 等）
-    print("\n--- effects のキー ---")
-    print(f"  {list(effects2.keys()) if isinstance(effects2, dict) else effects2}")
-    if isinstance(effects2, dict):
-        if effects2.get("redirect"):
-            print(f"  redirect = {effects2.get('redirect')}")
-        if effects2.get("errors"):
-            print(f"  errors = {json.dumps(effects2.get('errors'), ensure_ascii=False)}")
+    tl_snap, tl_data = get_timeline_snapshot(html_eff)
+    if tl_snap is None:
+        print("  （再描画HTMLに reserve-timeline が見つかりません）")
+        return
 
-    # 4) 再描画HTML を解析 → ここに本当の時間帯・人数プルダウン／ボタンが出る
-    html_eff = ""
-    if isinstance(effects2, dict):
-        html_eff = effects2.get("html") or ""
-    if html_eff:
-        print("\n--- 選択後の再描画HTML を解析 ---")
-        soup2 = BeautifulSoup(html_eff, "html.parser")
-        dump_inputs(soup2)
-        dump_selects(soup2)
-        dump_buttons(soup2)
-        dump_wire_attrs(soup2, label="wire: 属性（選択後HTML）")
-        # 念のため生HTMLの先頭も少し
-        raw = " ".join(html_eff.split())
-        print(f"\n--- 選択後HTML（先頭1500文字）---\n{raw[:1500]}")
+    print(f"\n--- timeline.selectedDate = {tl_data.get('selectedDate')} ---")
+    reservable = dump_timeline_slots(tl_data)
+
+    # 予約可枠があればそれを、無ければ 11時/17時開始の枠を選んで挙動を観察
+    target_index = None
+    if reservable:
+        target_index = reservable[0]
+        print(f"\n  → 予約可枠あり。index={target_index} を selectSlot で選択して観察")
     else:
-        print("\n  （effects に html が含まれていません。data 側の startDateTimes を参照）")
+        computed = _unwrap_arr(tl_data.get("computed", []))
+        for raw_slot in (computed if isinstance(computed, list) else []):
+            slot = _unwrap_arr(raw_slot)
+            if isinstance(slot, dict) and str(slot.get("start", "")).startswith(("11:", "17:")):
+                target_index = slot.get("index")
+                break
+        if target_index is not None:
+            print(f"\n  → 予約可枠なし。参考に index={target_index}（11時/17時枠）を選んで挙動だけ観察")
+        else:
+            print("\n  → 選択できる枠が見つからないため selectSlot は試しません")
+            return
+
+    # selectSlot を呼ぶ（＝UI上で枠を選ぶだけ。next/確定は呼ばないので予約は発生しない）
+    fresh_xsrf = _get_xsrf_token(session)
+    s_snap, s_data, s_effects = livewire_call(
+        session, tl_snap, fresh_xsrf,
+        calls=[{"method": "selectSlot", "params": [target_index]}])
+    if s_snap is None:
+        print("  → selectSlot 呼び出しが失敗。上のエラーを参照。")
+        return
+
+    print("\n--- selectSlot 後の timeline 状態 ---")
+    for key in ("selectedStart", "selectedEnd", "clicked"):
+        print(f"  {key} = {json.dumps(s_data.get(key), ensure_ascii=False)[:200]}")
+
+    print("\n--- selectSlot の effects（★親へ渡すやり取り）---")
+    if isinstance(s_effects, dict):
+        print(f"  effects keys = {list(s_effects.keys())}")
+        if s_effects.get("dispatches"):
+            print(f"  dispatches = {json.dumps(s_effects.get('dispatches'), ensure_ascii=False)}")
+        if s_effects.get("returns"):
+            print(f"  returns = {json.dumps(s_effects.get('returns'), ensure_ascii=False)[:300]}")
+        if s_effects.get("errors"):
+            print(f"  errors = {json.dumps(s_effects.get('errors'), ensure_ascii=False)}")
+
+
+def reproduce_date_selection(session):
+    """新UI（タイムライン方式）の申込フローを読み取り専用で再現・観察する。
+    確定系メソッド（next/apply/reserve 等）は一切呼ばないので予約は発生しない。"""
+    snap_str, xsrf = extract_facility_snapshot(session)
+    if not snap_str:
+        line("★ 枠の診断")
+        print("  → 施設スナップショットが取れないため中断")
+        return
+    init_data = json.loads(snap_str)["data"]
+
+    # 1) 本番の対象日（60日後＝抽選対象）
+    target = date.today() + timedelta(days=DAYS_AHEAD)
+    weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target.weekday()]
+    diagnose_slot_flow(session, snap_str, xsrf, target.strftime("%Y-%m-%d"),
+                       weekday_ja, "本番の対象日（60日後）")
+
+    # 2) 直近で予約可能そうな日（カレンダーに既に出ている、unreservable でない最初の日）
+    #    ＝予約可枠の実データと selectSlot の挙動を確実に観察するため
+    soonest = None
+    dates_raw = _unwrap_arr(init_data.get("dates", []))
+    today = date.today()
+    for raw_day in (dates_raw if isinstance(dates_raw, list) else []):
+        day = _unwrap_arr(raw_day)
+        if not isinstance(day, dict):
+            continue
+        ds = _carbon_str(day.get("date"))
+        if not ds:
+            continue
+        try:
+            d_obj = datetime.fromisoformat(ds).date()
+        except ValueError:
+            continue
+        status = _status_str(day.get("reservableStatus"))
+        if d_obj > today and status != "unreservable":
+            soonest = d_obj
+            break
+    if soonest:
+        # 別セッション状態を避けるため施設ページを取り直してから実施
+        snap_str2, xsrf2 = extract_facility_snapshot(session)
+        if snap_str2:
+            wj = ["月", "火", "水", "木", "金", "土", "日"][soonest.weekday()]
+            diagnose_slot_flow(session, snap_str2, xsrf2, soonest.strftime("%Y-%m-%d"),
+                               wj, "直近の予約可能そうな日")
+    else:
+        print("\n（カレンダー上に unreservable 以外の日が見つかりませんでした）")
 
 
 def main():
