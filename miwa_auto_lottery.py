@@ -1,61 +1,98 @@
 #!/usr/bin/env python3
 """
-共用施設予約サイト 抽選自動申込スクリプト（Livewire v3 対応版 2）
-毎日1回実行 → 60日後が土日祝なら昼枠・夜枠の抽選申込を自動で行う
+共用施設予約サイト 抽選自動申込スクリプト（Playwright/ブラウザ自動操作版）
 
-予約フロー（Livewire ベース・診断で確認済み）:
-  1. GET  /facilities/{id}      → facility-detail の wire:snapshot 取得
-  2. POST /livewire/update      → 日付選択（selectStartDate）
-  3. POST /livewire/update      → 日時・人数・オプション設定
-  4. POST /livewire/update      → next メソッド → 確認ページへ redirect
-  5. 確認ページで確定操作        → /reserves/{id} 到達で完了確定
+サイトが「タイムラインをクリックして枠を選ぶ」JS中心のUI（Livewire v3）に作り替え
+られたため、requests でのHTTP直叩きでは枠が読み込めなくなった。本スクリプトは実際の
+ブラウザ（Chromium）を人間と同じように操作して申込む。
+
+申込フロー（実画面の操作順）:
+  1. ログイン
+  2. 施設ページを開く（BASE_URL/facilities/{id}）
+  3. カレンダーを開いて対象月へ移動 → 対象日をクリック（＝枠が読み込まれる）
+  4. タイムラインから該当枠（昼=11:00 / 夜=17:00）をクリックして選択（selectSlot）
+  5. 人数オプション（option 46/49/61）を設定
+  6. 「予約内容を確認する」→ 確認ページ
+  7. 確認ページで確定（抽選申込）→ /reserves/{id} 到達で完了
+
+安全装置:
+  - 環境変数 MIWA_DRY_RUN=1（既定）のときは、確認ページの手前で止めて
+    「予約は確定しない」。各ステップのスクリーンショットと画面HTMLを artifacts/ に保存する。
+    初回はこの安全モードで動作確認し、画面が想定どおりだと確認できたら
+    MIWA_DRY_RUN=0 にして本番稼働させる。
 """
 
 import os
-import json
 import re
-import html
-import time
-import urllib.parse
-import requests
+import sys
+import json
+import traceback
 from datetime import datetime, date, timedelta
+
+import requests
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 try:
     import jpholiday
 except ImportError:
     jpholiday = None
-    print("⚠️ jpholiday 未インストール（祝日判定なし、土日のみ対象）")
+    print("⚠️ jpholiday 未インストール（祝日判定なし、土日のみ対象）", flush=True)
 
 # ============================================================
 # 設定（マンション固有の値は環境変数から取得）
 # ============================================================
 BASE_URL = os.environ.get("MIWA_BASE_URL", "").rstrip("/")
+FACILITY_ID = os.environ.get("MIWA_FACILITY_ID_RESERVE", "")
+USER_ID = os.environ.get("MIWA_USER_ID", "")
+PASSWORD = os.environ.get("MIWA_PASSWORD", "")
+LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
+
 LOGIN_URL = f"{BASE_URL}/login"
-LIVEWIRE_UPDATE = f"{BASE_URL}/livewire/update"
+FACILITY_URL = f"{BASE_URL}/facilities/{FACILITY_ID}"
 
-FACILITY_ID_RESERVE = os.environ.get("MIWA_FACILITY_ID_RESERVE", "")
-FACILITY_URL = f"{BASE_URL}/facilities/{FACILITY_ID_RESERVE}"
+# DRY_RUN: 既定は安全モード（確定しない）。本番稼働時のみ MIWA_DRY_RUN=0 を設定。
+DRY_RUN = os.environ.get("MIWA_DRY_RUN", "1") != "0"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
-}
+# 60日後を対象（抽選受付開始日）
+DAYS_AHEAD = 60
 
-# 抽選申込する枠（option_id は診断で確認済み）
+ART_DIR = "artifacts"
+
+# 申込する枠（option_id は診断で確認済み）
 #   46 = 21時までの利用人数（0〜8）
 #   49 = 21時以降の利用人数（0〜4）
 #   61 = 夜枠用チェックイン予定時間（0=未選択 / 1=17:00〜19:00 ...）
 SLOTS = [
-    {"name": "昼枠（11:00〜15:00）", "time": "1100", "options": {46: 8, 49: 0, 61: 0}},
-    {"name": "夜枠（17:00〜翌9:00）", "time": "1700", "options": {46: 8, 49: 4, 61: 1}},
+    {"name": "昼枠（11:00〜15:00）", "start": "11:00", "options": {46: 8, 49: 0, 61: 0}},
+    {"name": "夜枠（17:00〜翌9:00）", "start": "17:00", "options": {46: 8, 49: 4, 61: 1}},
 ]
 
-# 60日後を対象（抽選受付開始日）
-DAYS_AHEAD = 60
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def shot(page, name):
+    """スクリーンショットを artifacts/ に保存（失敗しても処理は止めない）。"""
+    try:
+        os.makedirs(ART_DIR, exist_ok=True)
+        path = os.path.join(ART_DIR, f"{name}.png")
+        page.screenshot(path=path, full_page=True)
+        log(f"    📷 スクショ保存: {path}")
+    except Exception as e:
+        log(f"    （スクショ失敗: {e}）")
+
+
+def dump_html(page, name):
+    """画面HTMLを artifacts/ に保存（デバッグ用）。"""
+    try:
+        os.makedirs(ART_DIR, exist_ok=True)
+        path = os.path.join(ART_DIR, f"{name}.html")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        log(f"    📝 HTML保存: {path}")
+    except Exception as e:
+        log(f"    （HTML保存失敗: {e}）")
 
 
 # ============================================================
@@ -70,336 +107,362 @@ def is_weekend_or_holiday(d: date) -> bool:
 
 
 # ============================================================
-# Cookie ヘルパー（XSRF-TOKEN 重複対策）
+# Livewire スナップショット読み取り（枠の状態確認用）
 # ============================================================
-def _iter_xsrf_values(jar) -> list:
-    return [c.value for c in jar if c.name == "XSRF-TOKEN"]
-
-
-def _get_xsrf_token(session: requests.Session) -> str:
-    values = _iter_xsrf_values(session.cookies)
-    return urllib.parse.unquote(values[-1]) if values else ""
-
-
-def _set_xsrf_token(session: requests.Session, raw_value: str) -> None:
-    for cookie in list(session.cookies):
-        if cookie.name == "XSRF-TOKEN":
-            session.cookies.clear(cookie.domain, cookie.path, cookie.name)
-    session.cookies.set("XSRF-TOKEN", raw_value)
-
-
-# ============================================================
-# ログイン
-# ============================================================
-def create_session() -> requests.Session:
-    user_id = os.environ.get("MIWA_USER_ID", "")
-    password = os.environ.get("MIWA_PASSWORD", "")
-    if not user_id or not password:
-        print("⚠️ MIWA_USER_ID / MIWA_PASSWORD が未設定です")
-        return None
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    resp = session.get(LOGIN_URL, timeout=15)
-    resp.raise_for_status()
-    match = re.search(r'name="_token"\s+value="([^"]+)"', resp.text)
-    if not match:
-        print("⚠️ CSRFトークンが取得できません")
-        return None
-
-    resp = session.post(LOGIN_URL, data={
-        "_token": match.group(1),
-        "email": user_id,
-        "password": password,
-    }, timeout=15)
-    resp.raise_for_status()
-
-    if "/login" in resp.url:
-        print("⚠️ ログイン失敗（ID/パスワードをご確認ください）")
-        return None
-
-    print("ログイン成功")
-    return session
-
-
-# ============================================================
-# Livewire API ヘルパー
-# ============================================================
-def extract_facility_snapshot(session: requests.Session) -> tuple:
-    """施設詳細ページから facility-detail の wire:snapshot を取得する。"""
-    try:
-        resp = session.get(FACILITY_URL, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"  ⚠️ 施設ページ取得エラー: {e}")
-        return None, None
-
-    snaps = re.findall(r'wire:snapshot="((?:&[^;]+;|[^"])+)"', resp.text)
-    for s in snaps:
-        decoded = html.unescape(s)
+def read_snapshots(page) -> list:
+    """画面内の全 wire:snapshot を取り出して [(name, data), ...] を返す。"""
+    raw_list = page.evaluate(
+        "() => Array.from(document.querySelectorAll('[wire\\\\:snapshot]'))"
+        ".map(e => e.getAttribute('wire:snapshot'))"
+    )
+    out = []
+    for raw in raw_list or []:
         try:
-            d = json.loads(decoded)
-        except json.JSONDecodeError:
+            d = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
             continue
-        if "facility-detail" in d.get("memo", {}).get("name", ""):
-            return decoded, _get_xsrf_token(session)
-
-    print("  ⚠️ 施設詳細の Livewire スナップショットが見つかりません")
-    return None, None
+        out.append((d.get("memo", {}).get("name", ""), d.get("data", {})))
+    return out
 
 
-def livewire_call(session, snap_str, xsrf, updates=None, calls=None) -> tuple:
-    """Livewire update エンドポイントを呼び出す。
-    戻り値: (new_snap_str, new_data, effects) または (None, None, {})
-    """
-    if updates is None:
-        updates = {}
-    if calls is None:
-        calls = []
-
-    fresh_xsrf = _get_xsrf_token(session)
-    if fresh_xsrf:
-        xsrf = fresh_xsrf
-
-    body = {"components": [{"snapshot": snap_str, "updates": updates, "calls": calls}]}
-
-    try:
-        resp = session.post(
-            LIVEWIRE_UPDATE,
-            json=body,
-            headers={
-                "X-XSRF-TOKEN": xsrf,
-                "X-Livewire": "true",
-                "Accept": "application/json",
-                "Referer": FACILITY_URL,
-            },
-            timeout=20,
-        )
-    except requests.RequestException as e:
-        print(f"  ⚠️ Livewire リクエストエラー: {e}")
-        return None, None, {}
-
-    if resp.status_code != 200:
-        print(f"  ⚠️ Livewire エラー: {resp.status_code} {resp.text[:200]}")
-        return None, None, {}
-
-    resp_xsrf_values = _iter_xsrf_values(resp.cookies)
-    if resp_xsrf_values:
-        _set_xsrf_token(session, resp_xsrf_values[-1])
-
-    try:
-        comp = resp.json()["components"][0]
-        new_snap_str = comp["snapshot"]
-        new_data = json.loads(new_snap_str)["data"]
-        effects = comp.get("effects", {})
-        return new_snap_str, new_data, effects
-    except (KeyError, json.JSONDecodeError, IndexError) as e:
-        print(f"  ⚠️ Livewire レスポンス解析エラー: {e}")
-        return None, None, {}
-
-
-# ============================================================
-# Livewire データ構造のヘルパー
-# ============================================================
 def _unwrap_arr(v):
-    if isinstance(v, list) and len(v) == 2 and isinstance(v[1], dict) and v[1].get("s") == "arr":
+    if isinstance(v, list) and len(v) == 2 and isinstance(v[1], dict) and "s" in v[1]:
         return v[0]
     return v
 
 
-def _carbon_to_str(item):
-    if isinstance(item, str):
-        return item
-    if isinstance(item, list) and item and isinstance(item[0], str):
-        return item[0]
-    if isinstance(item, dict):
-        for k in ("value", "start", "datetime", "date"):
-            v = item.get(k)
-            if isinstance(v, str):
-                return v
-            if isinstance(v, list) and v and isinstance(v[0], str):
-                return v[0]
-    return None
+def _status_str(rs):
+    rs2 = _unwrap_arr(rs)
+    if isinstance(rs2, str):
+        return rs2
+    if isinstance(rs, list) and rs and isinstance(rs[0], str):
+        return rs[0]
+    return str(rs)
 
 
-def find_start_datetime(data: dict, time_code: str) -> str:
-    """選択日の startDateTimes から、指定枠（昼=11時/夜=17時）の実際の開始日時を探す。
-    見つからなければ None。"""
-    target_hour = 11 if time_code == "1100" else 17
-    raw = _unwrap_arr(data.get("startDateTimes", []))
-    items = list(raw.keys()) if isinstance(raw, dict) else (raw if isinstance(raw, list) else [])
-    for item in items:
-        dt_str = _carbon_to_str(item)
-        if not dt_str:
+def get_timeline_slots(page) -> list:
+    """reserve-timeline の computed から枠一覧を取り出す。
+    各要素 = {index, start, end, status, reserveKbn}。"""
+    slots = []
+    for name, data in read_snapshots(page):
+        if "reserve-timeline" not in name:
             continue
-        try:
-            hour = datetime.fromisoformat(dt_str).hour
-        except ValueError:
-            m = re.search(r'\b(\d{1,2}):(\d{2})\b', dt_str)
-            hour = int(m.group(1)) if m else None
-        if hour == target_hour:
-            return dt_str
-    return None
-
-
-# ============================================================
-# 確認ページの確定処理
-# ============================================================
-def _confirm_and_verify(session, url: str) -> bool:
-    """確認ページで確定操作を行い、/reserves/{id} に到達できたら True。"""
-    try:
-        resp = session.get(url, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as e:
-        print(f"    ⚠️ 確認ページ取得エラー: {e}")
-        return False
-
-    if re.search(r"/reserves/\d+", resp.url) or re.search(r"/reserves/\d+", resp.text):
-        return True
-
-    snaps = re.findall(r'wire:snapshot="((?:&[^;]+;|[^"])+)"', resp.text)
-    for s in snaps:
-        decoded = html.unescape(s)
-        try:
-            d = json.loads(decoded)
-        except json.JSONDecodeError:
-            continue
-        comp_data = d.get("data", {})
-        xsrf = _get_xsrf_token(session)
-
-        # 利用規約同意などのチェックボックスがあれば true にする
-        agree_props = ["agreeTerms", "agree", "isAgreed", "acceptTerms",
-                       "agreedToTerms", "acceptedTerms", "isAgree"]
-        agree_updates = {k: True for k in agree_props if k in comp_data}
-        use_snap = decoded
-        if agree_updates:
-            snap_a, _, _ = livewire_call(session, decoded, xsrf, updates=agree_updates)
-            if snap_a:
-                use_snap = snap_a
-
-        # 確定系メソッドを順に試し、/reserves/{id} 到達で成功確定
-        for method in ["apply", "reserve", "complete", "confirm", "submit",
-                       "save", "next", "store", "applyLottery", "reserveLottery"]:
-            snap2, _, effects2 = livewire_call(session, use_snap, xsrf,
-                                               calls=[{"method": method, "params": []}])
-            if snap2 is None:
+        computed = _unwrap_arr(data.get("computed", []))
+        for raw_slot in (computed if isinstance(computed, list) else []):
+            slot = _unwrap_arr(raw_slot)
+            if not isinstance(slot, dict):
                 continue
-            redirect2 = effects2.get("redirect")
-            if redirect2:
-                try:
-                    resp3 = session.get(redirect2, timeout=15)
-                    if re.search(r"/reserves/\d+", resp3.url) or re.search(r"/reserves/\d+", resp3.text):
-                        print(f"    ✅ 申込確定完了！（method={method}）")
-                        return True
-                except requests.RequestException:
-                    pass
+            slots.append({
+                "index": slot.get("index"),
+                "start": slot.get("start"),
+                "end": slot.get("end"),
+                "status": _status_str(slot.get("reservableStatus")),
+                "reserveKbn": slot.get("reserveKbn"),
+            })
+    return slots
 
-    print(f"    ⚠️ 確認ページの確定に至りませんでした: {url}")
+
+# ============================================================
+# ブラウザ操作の各ステップ
+# ============================================================
+def login(page):
+    log("ログイン中…")
+    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+    # メール/パスワード欄（name優先、無ければ type で）
+    for sel in ['input[name="email"]', 'input[type="email"]', 'input[type="text"]']:
+        if page.locator(sel).count():
+            page.fill(sel, USER_ID)
+            break
+    for sel in ['input[name="password"]', 'input[type="password"]']:
+        if page.locator(sel).count():
+            page.fill(sel, PASSWORD)
+            break
+    # 送信
+    for sel in ['button[type="submit"]', 'input[type="submit"]', 'button:has-text("ログイン")']:
+        if page.locator(sel).count():
+            page.locator(sel).first.click()
+            break
+    page.wait_for_load_state("networkidle", timeout=30000)
+    if "/login" in page.url:
+        shot(page, "login_failed")
+        raise RuntimeError("ログイン失敗（ID/パスワードをご確認ください）")
+    log("ログイン成功")
+
+
+def open_facility(page):
+    page.goto(FACILITY_URL, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_load_state("networkidle", timeout=30000)
+
+
+def open_calendar(page):
+    """日付表示ボタン（wire:click='toggle'）を押してカレンダーを開く。"""
+    btn = page.locator("button", has_text=re.compile(r"\d{4}年\d{2}月\d{2}日"))
+    if btn.count():
+        btn.first.click()
+        page.wait_for_timeout(800)
+        return True
+    # フォールバック: toggle を持つボタン
+    alt = page.locator('button[wire\\:click\\.prevent\\.stop="toggle"]')
+    if alt.count():
+        alt.first.click()
+        page.wait_for_timeout(800)
+        return True
     return False
 
 
+def current_visible_month(page) -> str:
+    """カレンダー(reserve-calendar)の visibleMonth を読む（例 '2026-06'）。"""
+    for name, data in read_snapshots(page):
+        if "reserve-calendar" in name:
+            return data.get("visibleMonth", "")
+    return ""
+
+
+def goto_month(page, target_month: str, max_clicks: int = 14):
+    """カレンダーを target_month（'YYYY-MM'）まで「次の月」ボタンで進める。"""
+    for _ in range(max_clicks):
+        cur = current_visible_month(page)
+        log(f"    カレンダー表示月: {cur} / 目標: {target_month}")
+        if cur == target_month:
+            return True
+        # 「次の月」ボタンの候補をいくつか試す
+        moved = False
+        for sel in [
+            'button[aria-label*="次"]', 'button[aria-label*="next"]',
+            '[wire\\:click*="next"]', '[wire\\:click*="Next"]',
+            '[wire\\:click*="changeMonth"]',
+        ]:
+            loc = page.locator(sel)
+            if loc.count():
+                try:
+                    loc.last.click()
+                    page.wait_for_timeout(700)
+                    moved = True
+                    break
+                except Exception:
+                    continue
+        if not moved:
+            log("    ⚠️ 「次の月」ボタンが見つかりませんでした（カレンダーHTMLを保存）")
+            dump_html(page, "calendar_no_nav")
+            return False
+    return current_visible_month(page) == target_month
+
+
+def click_date(page, target: date) -> bool:
+    """カレンダー上で対象日のセルをクリックする。"""
+    day = target.day
+    iso = target.strftime("%Y-%m-%d")
+    # 候補: wire:click に日付が入っているセル / 日付テキストのセル
+    candidates = [
+        f'[wire\\:click*="{iso}"]',
+        f'[wire\\:key*="{iso}"]',
+    ]
+    for sel in candidates:
+        loc = page.locator(sel)
+        if loc.count():
+            loc.first.click()
+            page.wait_for_timeout(1200)
+            return True
+    # テキスト（日にち数字）でクリック。カレンダー内の該当セルを探す。
+    cells = page.locator('[wire\\:key^="reserve-calendar-"] >> text=' + str(day))
+    if cells.count():
+        cells.first.click()
+        page.wait_for_timeout(1200)
+        return True
+    log("    ⚠️ 対象日のセルが特定できませんでした（カレンダーHTMLを保存）")
+    dump_html(page, "calendar_date_notfound")
+    return False
+
+
+def select_slot(page, start_label: str) -> bool:
+    """タイムラインから start_label（'11:00'/'17:00'）の枠を選んでクリックする。"""
+    slots = get_timeline_slots(page)
+    log(f"    タイムライン枠: " + ", ".join(
+        f"[{s['index']}]{s['start']}-{s['end']}({s['status']})" for s in slots) or "（枠なし）")
+    # まず予約可かつ開始時刻一致の枠
+    target = None
+    for s in slots:
+        if s["start"] == start_label and s["status"] == "reservable":
+            target = s
+            break
+    if target is None:
+        # 予約可が無い場合は時刻一致のみ（DRY_RUN時の挙動確認用）
+        for s in slots:
+            if s["start"] == start_label:
+                target = s
+                break
+    if target is None or target["index"] is None:
+        log(f"    ⚠️ {start_label} の枠が見つかりません")
+        return False
+    idx = target["index"]
+    log(f"    枠 index={idx}（{target['start']}-{target['end']} / {target['status']}）を選択")
+    loc = page.locator(f'[wire\\:key="slot-{idx}"]')
+    if not loc.count():
+        log(f"    ⚠️ slot-{idx} の要素が見つかりません")
+        return False
+    loc.first.click()
+    page.wait_for_timeout(1000)
+    return target["status"] == "reservable"
+
+
+def set_options(page, options: dict):
+    """人数オプションの select を設定する。"""
+    for opt_id, value in options.items():
+        sel = f'select[wire\\:model\\.change="selectOptionQuantities.{opt_id}"]'
+        loc = page.locator(sel)
+        if loc.count():
+            try:
+                loc.first.select_option(str(value))
+                page.wait_for_timeout(500)
+                log(f"    option {opt_id} = {value} 設定")
+            except Exception as e:
+                log(f"    ⚠️ option {opt_id} 設定失敗: {e}")
+        else:
+            log(f"    ⚠️ option {opt_id} の select が見つかりません")
+
+
+def click_confirm_button(page) -> bool:
+    """「予約内容を確認する」を押して確認ページへ。"""
+    for sel in ['button:has-text("予約内容を確認する")', 'button[type="submit"]']:
+        loc = page.locator(sel)
+        if loc.count():
+            loc.first.click()
+            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_timeout(800)
+            return True
+    return False
+
+
+def finalize_reservation(page) -> bool:
+    """確認ページで確定操作を行い、/reserves/{id} 到達で True。
+    DRY_RUN のときは押さずに False（未確定）。"""
+    if DRY_RUN:
+        log("    🟡 DRY_RUN のため確定はしません（確認ページのスクショ/HTMLのみ保存）")
+        return False
+    # 同意チェックがあれば入れる
+    for sel in ['input[type="checkbox"]']:
+        boxes = page.locator(sel)
+        for i in range(boxes.count()):
+            try:
+                if not boxes.nth(i).is_checked():
+                    boxes.nth(i).check()
+            except Exception:
+                pass
+    # 確定ボタンの候補
+    for sel in [
+        'button:has-text("抽選を申し込む")', 'button:has-text("抽選申込")',
+        'button:has-text("申し込む")', 'button:has-text("申込む")',
+        'button:has-text("予約する")', 'button:has-text("確定")',
+        'button[type="submit"]',
+    ]:
+        loc = page.locator(sel)
+        if loc.count():
+            log(f"    確定ボタン「{loc.first.inner_text().strip()}」を押下")
+            loc.first.click()
+            page.wait_for_load_state("networkidle", timeout=30000)
+            page.wait_for_timeout(1000)
+            if re.search(r"/reserves/\d+", page.url) or re.search(r"/reserves/\d+", page.content()):
+                return True
+    return bool(re.search(r"/reserves/\d+", page.url))
+
+
 # ============================================================
-# 1枠分の抽選申込（Livewire ベース）
+# 1枠分の申込
 # ============================================================
-def apply_lottery(session, target_date: date, slot: dict) -> str:
-    """戻り値: "applied"（確定） / "partial"（未確定） / "failed"。"""
-    date_str = target_date.strftime("%Y-%m-%d")
-    time_code = slot["time"]
+def apply_slot(page, target: date, slot: dict) -> str:
+    """戻り値: 'applied' / 'partial'(未確定) / 'failed'。"""
     name = slot["name"]
-    print(f"\n  [{name}] 申込開始 (date={date_str})")
+    tag = "day" if slot["start"] == "11:00" else "night"
+    log(f"\n  [{name}] 申込開始 (date={target})")
 
-    snap_str, xsrf = extract_facility_snapshot(session)
-    if not snap_str:
+    open_facility(page)
+    if not open_calendar(page):
+        log("    ⚠️ カレンダーを開けませんでした")
+        shot(page, f"{tag}_no_calendar")
+        dump_html(page, f"{tag}_no_calendar")
         return "failed"
 
-    # 日付を選択
-    snap_str, data, _ = livewire_call(session, snap_str, xsrf, updates={"selectStartDate": date_str})
-    if not snap_str:
-        print("  ⚠️ 日付選択失敗")
+    shot(page, f"{tag}_1_calendar_open")
+    dump_html(page, f"{tag}_1_calendar_open")
+
+    if not goto_month(page, target.strftime("%Y-%m")):
+        log("    ⚠️ 対象月へ移動できませんでした")
+        shot(page, f"{tag}_2_month_fail")
         return "failed"
 
-    reserve_kbn = data.get("reserveKbn", "不明")
-    print(f"  予約区分: {reserve_kbn}")
-
-    # 実際に提示されている開始日時を取得（無ければ固定値にフォールバック）
-    start_dt = find_start_datetime(data, time_code)
-    if not start_dt:
-        hour = int(time_code[:2])
-        start_dt = f"{date_str}T{hour:02d}:00:00+09:00"
-        print(f"  （startDateTimes に該当枠なし → 固定値 {start_dt} で試行）")
-    else:
-        print(f"  開始日時: {start_dt}")
-
-    # 日時・人数・オプションをまとめて設定
-    updates = {
-        "selectStartDate": date_str,
-        "selectStartDateTime": start_dt,
-        "selectReserveNumber": 1,
-    }
-    for opt_id, value in slot["options"].items():
-        updates[f"selectOptionQuantities.{opt_id}"] = value
-    snap_str, data, _ = livewire_call(session, snap_str, xsrf, updates=updates)
-    if not snap_str:
-        print("  ⚠️ オプション設定失敗")
+    if not click_date(page, target):
+        log("    ⚠️ 対象日を選択できませんでした")
+        shot(page, f"{tag}_3_date_fail")
         return "failed"
 
-    # next を呼び出して確認ステップへ
-    snap_str, data, effects = livewire_call(session, snap_str, xsrf, calls=[{"method": "next", "params": []}])
-    if not snap_str:
-        print("  ⚠️ 申込送信失敗（受付期間外・既申込の可能性）")
+    shot(page, f"{tag}_4_date_selected")
+
+    reservable = select_slot(page, slot["start"])
+    shot(page, f"{tag}_5_slot_selected")
+    if not reservable:
+        log("    ⚠️ 予約可能な枠ではありませんでした（受付期間外・満枠・既申込の可能性）")
+        # DRY_RUN中は挙動確認のため続行、本番は中断
+        if not DRY_RUN:
+            return "failed"
+
+    set_options(page, slot["options"])
+    shot(page, f"{tag}_6_options_set")
+
+    if not click_confirm_button(page):
+        log("    ⚠️ 「予約内容を確認する」を押せませんでした")
+        shot(page, f"{tag}_7_confirm_fail")
         return "failed"
 
-    errors = effects.get("errors")
-    if errors:
-        print(f"  ⚠️ バリデーションエラー: {errors}")
-        return "failed"
+    shot(page, f"{tag}_8_confirm_page")
+    dump_html(page, f"{tag}_8_confirm_page")
+    log(f"    確認ページURL: {page.url}")
 
-    redirect_url = effects.get("redirect")
-    if redirect_url:
-        print(f"  確認ページへ移動: {redirect_url}")
-        return "applied" if _confirm_and_verify(session, redirect_url) else "partial"
-
-    print("  ⚠️ 確認ページへ進めませんでした（未確定）")
+    ok = finalize_reservation(page)
+    if ok:
+        shot(page, f"{tag}_9_done")
+        log("    ✅ 申込確定完了！")
+        return "applied"
     return "partial"
 
 
 # ============================================================
-# LINE通知（任意：トークンがあれば結果を通知）
+# LINE通知
 # ============================================================
-def _send_line_message(message: str):
-    token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
-    if not token:
+def send_line(message: str):
+    if not LINE_TOKEN:
         return
     try:
         requests.post(
             "https://api.line.me/v2/bot/message/broadcast",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            headers={"Authorization": f"Bearer {LINE_TOKEN}", "Content-Type": "application/json"},
             json={"messages": [{"type": "text", "text": message}]},
             timeout=10,
         )
     except Exception as e:
-        print(f"  ❌ LINE通知エラー: {e}")
+        log(f"  ❌ LINE通知エラー: {e}")
 
 
 # ============================================================
 # メイン
 # ============================================================
 def main():
-    if not BASE_URL or not FACILITY_ID_RESERVE:
-        print("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID_RESERVE が未設定です")
+    if not BASE_URL or not FACILITY_ID:
+        log("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID_RESERVE が未設定です")
+        return
+    if not USER_ID or not PASSWORD:
+        log("⚠️ MIWA_USER_ID / MIWA_PASSWORD が未設定です")
         return
 
     target = date.today() + timedelta(days=DAYS_AHEAD)
     weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target.weekday()]
 
-    print(f"{'='*50}")
-    print(f"共用施設 抽選自動申込")
-    print(f"対象日: {target}（{weekday_ja}）")
-    print(f"{'='*50}")
+    log("=" * 50)
+    log("共用施設 抽選自動申込" + ("（DRY_RUN: 予約しない安全モード）" if DRY_RUN else ""))
+    log(f"対象日: {target}（{weekday_ja}）")
+    log("=" * 50)
 
     if not is_weekend_or_holiday(target):
-        print("→ 平日のためスキップ")
+        log("→ 平日のためスキップ")
         return
 
     holiday_name = ""
@@ -407,31 +470,55 @@ def main():
         h = jpholiday.is_holiday_name(target)
         if h:
             holiday_name = f"（{h}）"
-    print(f"→ 土日祝{holiday_name}のため抽選申込を実行")
-
-    session = create_session()
-    if not session:
-        return
+    log(f"→ 土日祝{holiday_name}のため抽選申込を実行")
 
     results = []
-    for slot in SLOTS:
-        outcome = apply_lottery(session, target, slot)
-        results.append((slot["name"], outcome))
-        time.sleep(1)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            locale="ja-JP",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+        )
+        page = context.new_page()
+        page.set_default_timeout(20000)
+        try:
+            login(page)
+        except Exception as e:
+            log(f"⚠️ {e}")
+            traceback.print_exc()
+            browser.close()
+            return
 
-    print(f"\n{'='*50}")
-    print("結果:")
+        for slot in SLOTS:
+            try:
+                outcome = apply_slot(page, target, slot)
+            except PWTimeout as e:
+                log(f"    ⚠️ タイムアウト: {e}")
+                shot(page, f"timeout_{slot['start']}")
+                outcome = "failed"
+            except Exception as e:
+                log(f"    ⚠️ エラー: {e}")
+                traceback.print_exc()
+                outcome = "failed"
+            results.append((slot["name"], outcome))
+
+        browser.close()
+
+    log("\n" + "=" * 50)
+    log("結果:" + ("（DRY_RUN: 確定はしていません）" if DRY_RUN else ""))
     label = {"applied": "✅ 申込完了", "partial": "🟠 要手動確認", "failed": "❌ 失敗"}
     lines = []
     for name, outcome in results:
-        print(f"  {name}: {label.get(outcome, outcome)}")
+        log(f"  {name}: {label.get(outcome, outcome)}")
         lines.append(f"  ・{name}: {label.get(outcome, outcome)}")
-    print(f"{'='*50}")
+    log("=" * 50)
 
-    # 1枠でも完了/要確認があれば通知
-    if any(o in ("applied", "partial") for _, o in results):
+    # 本番モードで完了/要確認があれば通知（DRY_RUNでは通知しない）
+    if not DRY_RUN and any(o in ("applied", "partial") for _, o in results):
         body = "\n".join(lines)
-        _send_line_message(
+        send_line(
             f"🎫【共用施設 抽選自動申込】\n対象日: {target}（{weekday_ja}）\n\n{body}\n\n"
             f"申込状況の確認👇\n{BASE_URL}/reserves"
         )
