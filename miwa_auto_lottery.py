@@ -498,14 +498,14 @@ def _js_check_required_boxes(page) -> int:
 
 
 def set_options(page, options: dict):
-    """人数オプション（数量select）を設定する。
-    変更ごとに Livewire 更新通信の完了を待ち、確実に登録する。0 の項目は変更しない。"""
-    for opt_id, value in options.items():
-        if value <= 0:
-            continue
-        model = f"selectOptionQuantities.{opt_id}"
-        r = change_select_and_wait(page, model, value)
-        log(f"    option {opt_id} = {value} 設定（{r}, 現在値={get_select_value(page, model)}）")
+    """人数オプション（数量select）を設定する。0 の項目は変更しない。
+    枠選択直後の再描画で最初の1回が取りこぼされることがあるため、2パスで確実に登録する。"""
+    targets = {opt_id: value for opt_id, value in options.items() if value > 0}
+    for pass_no in (1, 2):
+        for opt_id, value in targets.items():
+            model = f"selectOptionQuantities.{opt_id}"
+            r = change_select_and_wait(page, model, value)
+            log(f"    option {opt_id} = {value} 設定[{pass_no}]（{r}, 現在値={get_select_value(page, model)}）")
     page.wait_for_timeout(800)
 
 
@@ -792,10 +792,4 @@ def main():
     if not DRY_RUN and any(o in ("applied", "partial") for _, o in results):
         body = "\n".join(lines)
         send_line(
-            f"🎫【共用施設 抽選自動申込】\n対象日: {target}（{weekday_ja}）\n\n{body}\n\n"
-            f"申込状況の確認👇\n{BASE_URL}/reserves"
-        )
-
-
-if __name__ == "__main__":
-    main()
+            f"🎫【共用施設 抽選自動申込】\n対象日: {target}（{weekday_ja}）\n\n{body}\n\
