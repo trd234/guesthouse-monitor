@@ -792,4 +792,10 @@ def main():
     if not DRY_RUN and any(o in ("applied", "partial") for _, o in results):
         body = "\n".join(lines)
         send_line(
-            f"🎫【共用施設 抽選自動申込】\n対象日: {target}（{weekday_ja}）\n\n{body}\n\
+            f"🎫【共用施設 抽選自動申込】\n対象日: {target}（{weekday_ja}）\n\n{body}\n\n"
+            f"申込状況の確認👇\n{BASE_URL}/reserves"
+        )
+
+
+if __name__ == "__main__":
+    main()
