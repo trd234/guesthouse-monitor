@@ -142,24 +142,29 @@ def _status_str(rs):
 
 
 def get_timeline_slots(page) -> list:
-    """reserve-timeline の computed から枠一覧を取り出す。
-    各要素 = {index, start, end, status, reserveKbn}。"""
+    """タイムラインの各枠（slot-N）を DOM の title 属性から読み取る。
+    title 例: '2026/08/15 11:00 ～ 2026/08/15 15:00 予約可'
+    各要素 = {index, date(YYYY/MM/DD), start(HH:MM), status, title}。"""
+    raw = page.evaluate(
+        """() => Array.from(document.querySelectorAll('*'))
+            .filter(e => (e.getAttribute('wire:key') || '').startsWith('slot-'))
+            .map(e => ({ key: e.getAttribute('wire:key'),
+                         title: e.getAttribute('title') || '' }))"""
+    )
     slots = []
-    for name, data in read_snapshots(page):
-        if "reserve-timeline" not in name:
-            continue
-        computed = _unwrap_arr(data.get("computed", []))
-        for raw_slot in (computed if isinstance(computed, list) else []):
-            slot = _unwrap_arr(raw_slot)
-            if not isinstance(slot, dict):
-                continue
-            slots.append({
-                "index": slot.get("index"),
-                "start": slot.get("start"),
-                "end": slot.get("end"),
-                "status": _status_str(slot.get("reservableStatus")),
-                "reserveKbn": slot.get("reserveKbn"),
-            })
+    for item in raw or []:
+        m = re.search(r"slot-(\d+)", item.get("key", ""))
+        title = item.get("title", "")
+        date_m = re.search(r"(\d{4}/\d{2}/\d{2})", title)
+        time_m = re.search(r"\d{4}/\d{2}/\d{2}\s+(\d{2}:\d{2})", title)
+        status = title.strip().split()[-1] if title.strip() else ""
+        slots.append({
+            "index": int(m.group(1)) if m else None,
+            "date": date_m.group(1) if date_m else "",
+            "start": time_m.group(1) if time_m else "",
+            "status": status,
+            "title": title,
+        })
     return slots
 
 
@@ -258,13 +263,34 @@ def goto_month(page, target_month: str, max_clicks: int = 14):
     return current_visible_month(page) == target_month
 
 
+def debug_calendar_clickables(page):
+    """カレンダー内の『押せる要素（wire:click系）』と、その値・表示文字を一覧表示。
+    日付セルが何のメソッドを呼ぶか（selectDate など）を特定するため。"""
+    items = page.evaluate(
+        """() => {
+            const cal = Array.from(document.querySelectorAll('*'))
+                .find(e => (e.getAttribute('wire:key') || '').startsWith('reserve-calendar-'));
+            if (!cal) return [];
+            return Array.from(cal.querySelectorAll('*'))
+                .filter(e => e.getAttributeNames().some(n => n.startsWith('wire:click')))
+                .map(e => {
+                    const n = e.getAttributeNames().find(x => x.startsWith('wire:click'));
+                    return { attr: n, val: e.getAttribute(n),
+                             text: (e.textContent || '').trim().slice(0, 12) };
+                }).slice(0, 80);
+        }"""
+    )
+    log(f"    [debug] カレンダー内クリック要素（{len(items or [])}件）↓")
+    for it in items or []:
+        log(f"      {it['attr']}={it['val']!r}  text={it['text']!r}")
+
+
 def click_date(page, target: date) -> bool:
     """カレンダー上で対象日のセルをクリックする。"""
     day = target.day
     iso = target.strftime("%Y-%m-%d")
-    # 対象月の日付セルの形を確認するためダンプ
-    dump_region(page, f"reserve-calendar-{target.strftime('%Y-%m')}",
-                before=100, after=14000, label="対象月カレンダー")
+    # 日付セルが呼ぶメソッドを特定するため、クリック可能要素を一覧表示
+    debug_calendar_clickables(page)
     # 候補: wire:click に日付が入っているセル / wire:key に日付
     for sel in [
         f'[wire\\:click*="{iso}"]',
@@ -294,38 +320,32 @@ def click_date(page, target: date) -> bool:
     return False
 
 
-def select_slot(page, start_label: str) -> bool:
-    """タイムラインから start_label（'11:00'/'17:00'）の枠を選んでクリックする。"""
+def select_slot(page, target: date, start_label: str) -> bool:
+    """タイムラインから対象日・start_label（'11:00'/'17:00'）の枠を選んでクリックする。"""
+    date_slash = target.strftime("%Y/%m/%d")
     slots = get_timeline_slots(page)
     log("    タイムライン枠: " + (", ".join(
-        f"[{s['index']}]{s['start']}-{s['end']}({s['status']})" for s in slots) or "（枠なし）"))
-    if not slots:
-        # 内部データが読めない場合に備え、タイムラインのHTMLを出して枠の形を確認する
-        dump_region(page, "selectSlot", before=600, after=12000, label="タイムライン")
-    # まず予約可かつ開始時刻一致の枠
-    target = None
-    for s in slots:
-        if s["start"] == start_label and s["status"] == "reservable":
-            target = s
-            break
-    if target is None:
-        # 予約可が無い場合は時刻一致のみ（DRY_RUN時の挙動確認用）
-        for s in slots:
-            if s["start"] == start_label:
-                target = s
-                break
-    if target is None or target["index"] is None:
-        log(f"    ⚠️ {start_label} の枠が見つかりません")
+        f"[{s['index']}]{s['date']} {s['start']}({s['status']})" for s in slots) or "（枠なし）"))
+
+    # 対象日・開始時刻が一致する枠
+    cand = [s for s in slots if s["date"] == date_slash and s["start"] == start_label]
+    if not cand:
+        log(f"    ⚠️ {date_slash} {start_label} の枠が見つかりません"
+            f"（タイムラインが対象日に切り替わっていない可能性）")
         return False
-    idx = target["index"]
-    log(f"    枠 index={idx}（{target['start']}-{target['end']} / {target['status']}）を選択")
+    target_slot = cand[0]
+    reservable = target_slot["status"] == "予約可"
+    idx = target_slot["index"]
+    log(f"    枠 index={idx}（{target_slot['title']}）を選択")
+    if idx is None:
+        return False
     loc = page.locator(f'[wire\\:key="slot-{idx}"]')
     if not loc.count():
         log(f"    ⚠️ slot-{idx} の要素が見つかりません")
         return False
     loc.first.click()
     page.wait_for_timeout(1000)
-    return target["status"] == "reservable"
+    return reservable
 
 
 def set_options(page, options: dict):
@@ -420,7 +440,7 @@ def apply_slot(page, target: date, slot: dict) -> str:
 
     shot(page, f"{tag}_4_date_selected")
 
-    reservable = select_slot(page, slot["start"])
+    reservable = select_slot(page, target, slot["start"])
     shot(page, f"{tag}_5_slot_selected")
     if not reservable:
         log("    ⚠️ 予約可能な枠ではありませんでした（受付期間外・満枠・既申込の可能性）")
