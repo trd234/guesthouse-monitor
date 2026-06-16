@@ -464,11 +464,7 @@ def _js_check_required_boxes(page) -> int:
 
 
 def set_options(page, options: dict):
-    """人数オプション（数量select）を設定し、必須の✓チェックボックスをONにする。"""
-    # 構造確認のためオプション欄のHTMLを出す
-    dump_region(page, "21時までの利用人数", before=200, after=4500, label="オプション欄")
-    debug_options(page)
-
+    """人数オプション（数量select）を設定する。"""
     # 数量をセット（実操作優先・不可ならJS）。0 の項目は変更しない。
     for opt_id, value in options.items():
         if value <= 0:
@@ -486,7 +482,6 @@ def set_options(page, options: dict):
     except PWTimeout:
         pass
     page.wait_for_timeout(600)
-    debug_options(page)  # 設定後の状態を確認
 
 
 def debug_buttons(page, label=""):
@@ -538,41 +533,74 @@ def click_confirm_button(page) -> bool:
     page.wait_for_timeout(1500)
     # 進めたか（フォームの『予約内容を確認する』が消えたか / URL変化）で判定
     still_form = page.locator('button:has-text("予約内容を確認する")').count() > 0
-    log(f"    送信後: URL={page.url}（変化={page.url != before}） フォーム残存={still_form}")
-    return True
+    advanced = (not still_form) or ("reserve-confirm" in page.url)
+    log(f"    送信後: URL={page.url}（変化={page.url != before}） 確認ページ到達={advanced}")
+    return advanced
 
 
-def finalize_reservation(page) -> bool:
-    """確認ページで確定操作を行い、/reserves/{id} 到達で True。
+# 申込完了を示す文言（完了画面: 「抽選待ち」「抽選予約を受付けました。」等）
+DONE_KEYWORDS = ["受付けました", "抽選待ち", "抽選予約のキャンセル", "予約を受け付け", "申込が完了"]
+
+
+def finalize_reservation(page, tag: str) -> bool:
+    """確認ページで『利用規約に同意』→『抽選予約する』を行い、申込完了を確認する。
     DRY_RUN のときは押さずに False（未確定）。"""
     if DRY_RUN:
         log("    🟡 DRY_RUN のため確定はしません（確認ページのスクショ/HTMLのみ保存）")
         return False
-    # 同意チェックがあれば入れる
-    for sel in ['input[type="checkbox"]']:
-        boxes = page.locator(sel)
-        for i in range(boxes.count()):
-            try:
-                if not boxes.nth(i).is_checked():
-                    boxes.nth(i).check()
-            except Exception:
-                pass
-    # 確定ボタンの候補
-    for sel in [
-        'button:has-text("抽選を申し込む")', 'button:has-text("抽選申込")',
-        'button:has-text("申し込む")', 'button:has-text("申込む")',
-        'button:has-text("予約する")', 'button:has-text("確定")',
-        'button[type="submit"]',
-    ]:
-        loc = page.locator(sel)
-        if loc.count():
-            log(f"    確定ボタン「{loc.first.inner_text().strip()}」を押下")
-            loc.first.click()
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.wait_for_timeout(1000)
-            if re.search(r"/reserves/\d+", page.url) or re.search(r"/reserves/\d+", page.content()):
-                return True
-    return bool(re.search(r"/reserves/\d+", page.url))
+
+    # 利用規約に同意（チェックボックスをON）。実操作＋JSの二重で確実にする。
+    boxes = page.locator('input[type="checkbox"]')
+    for i in range(boxes.count()):
+        try:
+            boxes.nth(i).check(force=True, timeout=3000)
+        except Exception:
+            pass
+    page.evaluate(
+        """() => document.querySelectorAll('input[type=checkbox]').forEach(b => {
+            if (!b.checked) {
+                b.checked = true;
+                b.dispatchEvent(new Event('input', {bubbles: true}));
+                b.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+        })""")
+    page.wait_for_timeout(600)
+
+    # 「抽選予約する」を押す（ボタン＋フォーム submit=reserve をJSでも発火）
+    loc = page.locator('button:has-text("抽選予約する")')
+    if loc.count():
+        try:
+            loc.first.click(force=True)
+        except Exception as e:
+            log(f"    （抽選予約するボタンのクリック失敗: {e}）")
+    res = page.evaluate(
+        """() => {
+            const f = Array.from(document.querySelectorAll('form')).find(e =>
+                e.getAttributeNames().some(n => n.startsWith('wire:submit')));
+            if (!f) return 'no-form';
+            if (f.requestSubmit) f.requestSubmit(); else
+                f.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+            return 'submitted';
+        }""")
+    log(f"    抽選予約 送信: {res}")
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(2000)
+
+    shot(page, f"{tag}_9_after_reserve")
+    dump_html(page, f"{tag}_9_after_reserve")
+    body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
+    log(f"    確定後 URL={page.url}")
+    log(f"    確定後テキスト（先頭600字）: {body[:600]}")
+
+    done = any(k in body for k in DONE_KEYWORDS) or bool(re.search(r"/reserves/\d+", page.url))
+    if done:
+        log("    ✅ 申込完了（抽選待ち）を確認")
+    else:
+        log("    ⚠️ 完了の確認文言が見つかりませんでした（要確認）")
+    return done
 
 
 # ============================================================
@@ -625,14 +653,8 @@ def apply_slot(page, target: date, slot: dict) -> str:
     shot(page, f"{tag}_8_confirm_page")
     dump_html(page, f"{tag}_8_confirm_page")
     log(f"    確認ページURL: {page.url}")
-    debug_buttons(page, label="確認ページ")
-    try:
-        txt = " ".join((page.evaluate("() => document.body.innerText") or "").split())
-        log(f"    [debug] 確認ページの画面テキスト（先頭2500字）↓\n{txt[:2500]}")
-    except Exception as e:
-        log(f"    （画面テキスト取得失敗: {e}）")
 
-    ok = finalize_reservation(page)
+    ok = finalize_reservation(page, tag)
     if ok:
         shot(page, f"{tag}_9_done")
         log("    ✅ 申込確定完了！")
