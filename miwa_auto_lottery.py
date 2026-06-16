@@ -285,38 +285,38 @@ def debug_calendar_clickables(page):
         log(f"      {it['attr']}={it['val']!r}  text={it['text']!r}")
 
 
+def _js_dispatch_click_by_wire(page, attr_val: str) -> str:
+    """wire:click 系属性の値が attr_val の要素へ MouseEvent を直接 dispatch する。"""
+    return page.evaluate(
+        """(val) => {
+            const el = Array.from(document.querySelectorAll('*')).find(e =>
+                e.getAttributeNames().some(n => n.startsWith('wire:click')
+                    && e.getAttribute(n) === val));
+            if (!el) return 'no-el';
+            el.scrollIntoView({block: 'center'});
+            el.dispatchEvent(new MouseEvent('click',
+                {bubbles: true, cancelable: true, view: window}));
+            return 'clicked';
+        }""", attr_val)
+
+
 def click_date(page, target: date) -> bool:
-    """カレンダー上で対象日のセルをクリックする。"""
-    day = target.day
+    """カレンダー上で対象日を選択する（JSで selectDate を直接発火し、
+    タイムラインが対象日に切り替わるまで確認する）。"""
     iso = target.strftime("%Y-%m-%d")
-    # 日付セルが呼ぶメソッドを特定するため、クリック可能要素を一覧表示
-    debug_calendar_clickables(page)
-    # 候補: wire:click に日付が入っているセル / wire:key に日付
-    for sel in [
-        f'[wire\\:click*="{iso}"]',
-        f'[wire\\:key*="{iso}"]',
-        f'[wire\\:click*="selectDate(\'{iso}\')"]',
-    ]:
-        loc = page.locator(sel)
-        if loc.count():
-            try:
-                loc.first.click()
-                page.wait_for_timeout(1300)
-                return True
-            except Exception as e:
-                log(f"    （{sel} クリック失敗: {e}）")
-    # カレンダーポップアップ内で、日にち数字のクリック可能セルを探す
-    cal = page.locator('[wire\\:key^="reserve-calendar-"]')
-    if cal.count():
-        cell = cal.first.get_by_text(re.compile(rf"^\s*{day}\s*$"))
-        if cell.count():
-            try:
-                cell.first.click()
-                page.wait_for_timeout(1300)
-                return True
-            except Exception as e:
-                log(f"    （日付テキストクリック失敗: {e}）")
-    log("    ⚠️ 対象日のセルが特定できませんでした")
+    date_slash = target.strftime("%Y/%m/%d")
+    res = _js_dispatch_click_by_wire(page, f"selectDate('{iso}')")
+    log(f"    selectDate('{iso}') 発火結果: {res}")
+    # タイムラインが対象日に切り替わるまで待つ（最大約8秒）
+    for _ in range(8):
+        try:
+            page.wait_for_load_state("networkidle", timeout=4000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(600)
+        if any(s["date"] == date_slash for s in get_timeline_slots(page)):
+            return True
+    log("    ⚠️ タイムラインが対象日に切り替わりませんでした")
     return False
 
 
@@ -381,8 +381,29 @@ def select_slot(page, target: date, start_label: str) -> bool:
     return selected
 
 
+def debug_options(page):
+    """オプション欄の input/select（チェックボックス・人数select）の構造を一覧表示。
+    『項目左側の✓』が何の入力か特定するため。"""
+    items = page.evaluate(
+        """() => Array.from(document.querySelectorAll('input, select')).map(e => {
+            const w = {};
+            e.getAttributeNames().filter(n => n.startsWith('wire:'))
+                .forEach(n => w[n] = e.getAttribute(n));
+            const row = e.closest('div');
+            const near = row ? (row.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 40) : '';
+            return { tag: e.tagName, type: e.getAttribute('type'),
+                     checked: e.checked, value: e.value, wire: w, near: near };
+        }).slice(0, 30)"""
+    )
+    log(f"    [debug] オプション欄の入力一覧（{len(items or [])}件）↓")
+    for it in items or []:
+        log(f"      <{it['tag']} type={it['type']} checked={it['checked']} value={it['value']!r}> "
+            f"wire={it['wire']} near={it['near']!r}")
+
+
 def set_options(page, options: dict):
     """人数オプションの select を設定する。"""
+    debug_options(page)
     for opt_id, value in options.items():
         sel = f'select[wire\\:model\\.change="selectOptionQuantities.{opt_id}"]'
         loc = page.locator(sel)
