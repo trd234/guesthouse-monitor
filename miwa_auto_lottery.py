@@ -112,7 +112,8 @@ def is_weekend_or_holiday(d: date) -> bool:
 def read_snapshots(page) -> list:
     """画面内の全 wire:snapshot を取り出して [(name, data), ...] を返す。"""
     raw_list = page.evaluate(
-        "() => Array.from(document.querySelectorAll('[wire\\\\:snapshot]'))"
+        "() => Array.from(document.querySelectorAll('*'))"
+        ".filter(e => e.hasAttribute('wire:snapshot'))"
         ".map(e => e.getAttribute('wire:snapshot'))"
     )
     out = []
@@ -208,6 +209,33 @@ def open_calendar(page):
         page.wait_for_timeout(800)
         return True
     return False
+
+
+def debug_calendar(page):
+    """開いたカレンダーの構造をログに出力（月送りボタン・日付セルの形を確認するため）。"""
+    snaps = read_snapshots(page)
+    log(f"    [debug] snapshot数={len(snaps)} names={[n for n, _ in snaps]}")
+    # reserve-calendar コンポーネントの outerHTML を取り出す
+    outer = page.evaluate(
+        """() => {
+            const els = Array.from(document.querySelectorAll('*'))
+                .filter(e => e.hasAttribute('wire:snapshot'));
+            for (const e of els) {
+                try {
+                    const d = JSON.parse(e.getAttribute('wire:snapshot'));
+                    if (((d.memo && d.memo.name) || '').includes('reserve-calendar'))
+                        return e.outerHTML;
+                } catch (x) {}
+            }
+            return '';
+        }"""
+    )
+    if outer:
+        snippet = " ".join(outer.split())[:6000]
+        log("    [debug] reserve-calendar outerHTML（先頭6000字）↓")
+        log(snippet)
+    else:
+        log("    [debug] reserve-calendar 要素が見つかりません")
 
 
 def current_visible_month(page) -> str:
@@ -384,6 +412,7 @@ def apply_slot(page, target: date, slot: dict) -> str:
 
     shot(page, f"{tag}_1_calendar_open")
     dump_html(page, f"{tag}_1_calendar_open")
+    debug_calendar(page)
 
     if not goto_month(page, target.strftime("%Y-%m")):
         log("    ⚠️ 対象月へ移動できませんでした")
