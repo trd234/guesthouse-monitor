@@ -344,54 +344,71 @@ def get_selected_start(page) -> str:
         }""") or ""
 
 
+def get_select_value(page, model: str) -> str:
+    return page.evaluate(
+        """(model) => {
+            const el = Array.from(document.querySelectorAll('select'))
+                .find(e => e.getAttribute('wire:model.change') === model);
+            return el ? el.value : '';
+        }""", model) or ""
+
+
+def get_select_options(page, model: str) -> list:
+    return page.evaluate(
+        """(model) => {
+            const el = Array.from(document.querySelectorAll('select'))
+                .find(e => e.getAttribute('wire:model.change') === model);
+            return el ? Array.from(el.options).map(o => (
+                { value: o.value, text: (o.textContent || '').trim() })) : [];
+        }""", model) or []
+
+
+def set_livewire_select(page, model: str, value) -> str:
+    """wire:model.change の select に値をセットする。
+    まず実操作(select_option)を試し、不可ならJSで value+change を発火。"""
+    loc = page.locator(f'select[wire\\:model\\.change="{model}"]')
+    if loc.count():
+        try:
+            loc.first.select_option(str(value), timeout=4000)
+            return "pw-ok"
+        except Exception:
+            pass
+    return "js:" + _js_set_select(page, model, value)
+
+
 def select_slot(page, target: date, start_label: str) -> bool:
-    """タイムラインから対象日・start_label（'11:00'/'17:00'）の枠を選択する。
-    selectStartDateTime で確定状態を確認する（実マウスクリックで selectSlot を発火）。"""
-    date_slash = target.strftime("%Y/%m/%d")
+    """親フォームの selectStartDateTime プルダウンを直接設定して枠を選ぶ
+    （タイムラインの子→親伝播を回避）。"""
     want = f"{target.strftime('%Y-%m-%d')} {start_label}"  # 例 '2026-08-15 17:00'
-    slots = get_timeline_slots(page)
-    log("    タイムライン枠: " + (", ".join(
-        f"[{s['index']}]{s['date']} {s['start']}({s['status']})" for s in slots) or "（枠なし）"))
 
-    matches = [s for s in slots if s["date"] == date_slash and s["start"] == start_label]
-    if not matches:
-        log(f"    ⚠️ {date_slash} {start_label} の枠が見つかりません"
-            f"（タイムラインが対象日に切り替わっていない可能性）")
-        return False
-
-    # すでに目的の時刻が選択済みか（昼枠は自動選択されている）
     if get_selected_start(page).startswith(want):
         log(f"    {start_label} はすでに選択済み（selectStartDateTime一致）")
         return True
 
-    # 予約可（または選択中）の枠を実マウスクリック（force=Trueで重なりを無視）
-    clickable = [s for s in matches if s["status"] in ("予約可", "選択中")]
-    if not clickable:
-        log(f"    ⚠️ {start_label} は予約可ではありません（状態: {[s['status'] for s in matches]}）")
+    opts = get_select_options(page, "selectStartDateTime")
+    log(f"    selectStartDateTime の選択肢: {opts}")
+    opt = next((o for o in opts
+                if o["value"].startswith(want) or o["text"].strip() == start_label), None)
+    if not opt:
+        log(f"    ⚠️ {start_label} の選択肢が見つかりません")
         return False
-    idx = clickable[0]["index"]
-    log(f"    枠 index={idx}（{clickable[0]['title']}）をクリック")
-    loc = page.locator(f'[wire\\:key="slot-{idx}"]')
-    if not loc.count():
-        log(f"    ⚠️ slot-{idx} の要素が見つかりません")
-        return False
-    try:
-        loc.first.click(force=True)
-    except Exception as e:
-        log(f"    ⚠️ slot-{idx} クリック失敗: {e}")
-        return False
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(1200)
 
-    sel = get_selected_start(page)
-    log(f"    クリック後 selectStartDateTime={sel}")
-    if not sel.startswith(want):
-        log("    ⚠️ 目的の時刻が選択されませんでした")
-        return False
-    return True
+    r = set_livewire_select(page, "selectStartDateTime", opt["value"])
+    log(f"    selectStartDateTime = {opt['value']} 設定（{r}）")
+
+    # 反映されるまでポーリング（最大約6秒）
+    for _ in range(8):
+        try:
+            page.wait_for_load_state("networkidle", timeout=3000)
+        except PWTimeout:
+            pass
+        page.wait_for_timeout(500)
+        if get_selected_start(page).startswith(want):
+            log(f"    選択OK selectReserveNumber={get_select_value(page, 'selectReserveNumber')}")
+            return True
+    log(f"    ⚠️ selectStartDateTime が {want} になりませんでした"
+        f"（現在: {get_selected_start(page)}）")
+    return False
 
 
 def debug_options(page):
@@ -452,16 +469,16 @@ def set_options(page, options: dict):
     dump_region(page, "21時までの利用人数", before=200, after=4500, label="オプション欄")
     debug_options(page)
 
-    # 必須の✓チェックボックスをON
-    n = _js_check_required_boxes(page)
-    log(f"    チェックボックスをON: {n}件")
-
-    # 数量を JS でセット（input/change を確実に発火）。0 の項目は変更しない。
+    # 数量をセット（実操作優先・不可ならJS）。0 の項目は変更しない。
     for opt_id, value in options.items():
         if value <= 0:
             continue
-        r = _js_set_select(page, f"selectOptionQuantities.{opt_id}", value)
-        log(f"    option {opt_id} = {value} 設定（結果={r}）")
+        r = set_livewire_select(page, f"selectOptionQuantities.{opt_id}", value)
+        log(f"    option {opt_id} = {value} 設定（{r}）")
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PWTimeout:
+            pass
         page.wait_for_timeout(400)
 
     try:
@@ -491,15 +508,38 @@ def debug_buttons(page, label=""):
 
 
 def click_confirm_button(page) -> bool:
-    """「予約内容を確認する」を押して確認ページへ。"""
+    """「予約内容を確認する」を押して確認ページへ進む。
+    ボタンクリックに加え、フォームの submit(=next) をJSで直接発火させる。"""
+    before = page.url
+    # 1) ボタンを押す
     for sel in ['button:has-text("予約内容を確認する")', 'button[type="submit"]']:
         loc = page.locator(sel)
         if loc.count():
-            loc.first.click()
-            page.wait_for_load_state("networkidle", timeout=30000)
-            page.wait_for_timeout(800)
-            return True
-    return False
+            try:
+                loc.first.click(force=True)
+            except Exception as e:
+                log(f"    （確認ボタンクリック失敗: {e}）")
+            break
+    # 2) フォーム submit(=next) をJSでも発火（保険）
+    res = page.evaluate(
+        """() => {
+            const f = Array.from(document.querySelectorAll('form')).find(e =>
+                e.getAttributeNames().some(n => n.startsWith('wire:submit')));
+            if (!f) return 'no-form';
+            if (f.requestSubmit) f.requestSubmit(); else
+                f.dispatchEvent(new Event('submit', {bubbles: true, cancelable: true}));
+            return 'submitted';
+        }""")
+    log(f"    （フォーム送信: {res}）")
+    try:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(1500)
+    # 進めたか（フォームの『予約内容を確認する』が消えたか / URL変化）で判定
+    still_form = page.locator('button:has-text("予約内容を確認する")').count() > 0
+    log(f"    送信後: URL={page.url}（変化={page.url != before}） フォーム残存={still_form}")
+    return True
 
 
 def finalize_reservation(page) -> bool:
