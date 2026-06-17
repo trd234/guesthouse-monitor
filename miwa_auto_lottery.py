@@ -818,16 +818,8 @@ def main():
     lines = []
     for name, outcome in results:
         log(f"  {name}: {label.get(outcome, outcome)}")
-        lines.append(f"  ・{name}: {label.get(outcome, outcome)}")
     log("=" * 50)
-
-    # 本番モードで完了/要確認があれば通知（DRY_RUNでは通知しない）
-    if not DRY_RUN and any(o in ("applied", "partial") for _, o in results):
-        body = "\n".join(lines)
-        send_line(
-            f"🎫【共用施設 抽選自動申込】\n対象日: {target}（{weekday_ja}）\n\n{body}\n\n"
-            f"申込状況の確認👇\n{BASE_URL}/reserves"
-        )
+    # LINE通知は不要のため送信しない（結果はログ／スクショで確認）
 
 
 if __name__ == "__main__":
