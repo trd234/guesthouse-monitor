@@ -49,6 +49,10 @@ DAYS_AHEAD = int(os.environ.get("MIWA_MONITOR_DAYS", "45"))
 LOOP_COUNT = int(os.environ.get("MIWA_MONITOR_LOOPS", "3"))
 LOOP_INTERVAL_SEC = int(os.environ.get("MIWA_MONITOR_INTERVAL", "60"))
 
+# 平日の空き通知のクールダウン（時間）。同じ日・同じ枠は、一度通知したら
+# この時間が経つまで再通知しない（10分おきの重複通知を防ぐ）。
+NOTIFY_COOLDOWN_HOURS = int(os.environ.get("MIWA_NOTIFY_COOLDOWN_HOURS", "24"))
+
 # 安全モード（1=予約しない）。cronは0、手動実行は既定1。
 DRY_RUN = os.environ.get("MIWA_DRY_RUN", "1") != "0"
 
@@ -98,7 +102,12 @@ def load_state() -> dict:
     else:
         st = {}
     st.setdefault("booked", [])      # 予約に成功した "YYYY-MM-DD_HHMM"
-    st.setdefault("notified", [])    # 空き通知済みの "YYYY-MM-DD_HHMM"
+    # 空き通知済み: {"YYYY-MM-DD_HHMM": "最後に通知した時刻(ISO)"}
+    st.setdefault("notified", {})
+    # 旧形式（リスト）からの移行: 通知済み扱いとして現在時刻を入れておく
+    if isinstance(st["notified"], list):
+        now_iso = datetime.now(JST).isoformat()
+        st["notified"] = {k: now_iso for k in st["notified"]}
     return st
 
 
@@ -314,7 +323,7 @@ def run_once(page, state: dict, loop_index: int):
         targets += weekdays
     targets.sort()
 
-    current_keys = set()
+    now = datetime.now(JST)
     found_days = 0
     for d in targets:
         date_str = d.isoformat()
@@ -325,8 +334,6 @@ def run_once(page, state: dict, loop_index: int):
         avail_slots = [s for s in SLOTS_PRIORITY if s["start"] in times]
         label = "・".join(s["name"] for s in avail_slots)
         log(f"  🟢 {date_str}（{weekday_ja(d)}）空き: {label}")
-        for s in avail_slots:
-            current_keys.add(f"{date_str}_{s['time']}")
 
         if is_weekend_or_holiday(d):
             # 土日祝 → 自動予約（夜枠優先で順に。両方空きなら両方）
@@ -347,20 +354,30 @@ def run_once(page, state: dict, loop_index: int):
             if partial_names and not DRY_RUN:
                 notify_partial(date_str, partial_names)
         else:
-            # 平日 → 新規の空きだけ通知
+            # 平日 → クールダウン経過後の空きだけ通知（10分おきの重複を防ぐ）
             new_names = []
             for s in avail_slots:
                 key = f"{date_str}_{s['time']}"
-                if key not in notified:
-                    notified.append(key)
+                last = notified.get(key)
+                recently = False
+                if last:
+                    try:
+                        recently = (now - datetime.fromisoformat(last)) \
+                            < timedelta(hours=NOTIFY_COOLDOWN_HOURS)
+                    except ValueError:
+                        recently = False
+                if not recently:
+                    notified[key] = now.isoformat()
                     new_names.append(s["name"])
             if new_names:
                 notify_vacancy(date_str, new_names)
 
     log(f"  チェック {len(targets)}日（うち土日祝 {len(holidays)}日）／空き {found_days}日")
 
-    # 空きが消えた通知済みキーは解除（次の空きで再通知できるように）
-    state["notified"] = [k for k in notified if k in current_keys]
+    # 既に過ぎた日付の通知記録は破棄（状態ファイルを肥大化させない）
+    today_iso = now.date().isoformat()
+    state["notified"] = {k: t for k, t in notified.items()
+                         if k.rsplit("_", 1)[0] >= today_iso}
     state["booked"] = booked
 
 
