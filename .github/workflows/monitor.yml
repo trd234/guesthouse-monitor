@@ -4,11 +4,10 @@ on:
   workflow_dispatch:         # 外部cron（cron-job.org）または手動で実行
     inputs:
       dry_run:
-        description: '安全モード（0=本番で予約, 1=予約しない/確認まで）'
-        required: false
+        description: '0=本番で予約 / 1=予約しない（確認まで）'
         default: '0'
 
-# 同時に複数走らないようにする（二重予約・無駄な実行を防ぐ）
+# 同時に複数走らないようにする（二重予約防止）
 concurrency:
   group: miwa-monitor
   cancel-in-progress: false
@@ -16,29 +15,23 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v6
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
 
-      - name: ライブラリインストール
-        run: pip install -r requirements.txt
-
-      - name: ブラウザ(Chromium)インストール
-        run: python -m playwright install --with-deps chromium
-
-      # 前回の状態ファイルをキャッシュから復元（重複通知・二重予約を防ぐため）
-      - name: 前回の状態を復元
-        uses: actions/cache@v5
+      # 予約済み・通知済みの記録を前回から引き継ぐ（重複通知・二重予約防止）
+      - uses: actions/cache@v5
         with:
           path: miwa_state.json
           key: miwa-state-${{ github.run_id }}
-          restore-keys: |
-            miwa-state-
+          restore-keys: miwa-state-
 
-      - name: 空き状況チェック＆自動予約
+      - name: 空き監視＆自動予約
         run: python miwa_monitor.py
         env:
           MIWA_BASE_URL: ${{ secrets.MIWA_BASE_URL }}
@@ -46,12 +39,10 @@ jobs:
           MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
           MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
           LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          # 手動実行時は入力値（既定0=本番）。外部cronは入力なし→既定0で本番。
-          MIWA_DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+          MIWA_DRY_RUN: ${{ inputs.dry_run || '0' }}
 
-      - name: スクリーンショット等を保存
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: miwa-monitor-screenshots
           path: artifacts/
