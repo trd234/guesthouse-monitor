@@ -2,34 +2,27 @@ name: 共用施設 抽選自動申込
 
 on:
   schedule:
-    - cron: '0 1 * * *'     # 毎日 01:00 UTC = 10:00 JST に実行
-  workflow_dispatch:         # 手動実行も可能
+    - cron: '0 1 * * *'     # 毎日 10:00 JST（本番）
+  workflow_dispatch:         # 手動実行
     inputs:
       dry_run:
-        description: '安全モード（1=予約しない/確認まで, 0=本番で確定）'
-        required: false
+        description: '1=確認ページで止める（安全） / 0=本番で申込む'
         default: '1'
       target_date:
-        description: '対象日（YYYY-MM-DD）。空欄なら通常どおり60日後。指定時は曜日・祝日に関係なく実行'
-        required: false
+        description: '対象日 YYYY-MM-DD（空欄=60日後。指定時は曜日不問）'
         default: ''
 
 jobs:
   lottery:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-
       - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-
-      - name: ライブラリインストール
-        run: pip install -r requirements.txt
-
-      - name: ブラウザ(Chromium)インストール
-        run: python -m playwright install --with-deps chromium
-
+      - run: pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
       - name: 抽選自動申込
         run: python miwa_auto_lottery.py
         env:
@@ -37,15 +30,10 @@ jobs:
           MIWA_FACILITY_ID_RESERVE: ${{ secrets.MIWA_FACILITY_ID_RESERVE }}
           MIWA_USER_ID: ${{ secrets.MIWA_USER_ID }}
           MIWA_PASSWORD: ${{ secrets.MIWA_PASSWORD }}
-          LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.LINE_CHANNEL_ACCESS_TOKEN }}
-          # 定期実行(cron)は本番(0)。手動実行のときは入力値、無指定なら安全モード(1)。
-          MIWA_DRY_RUN: ${{ github.event_name == 'schedule' && '0' || (github.event.inputs.dry_run || '1') }}
-          # 対象日の手動指定（手動実行のときだけ。定期実行では常に空＝60日後）
-          MIWA_TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target_date || '' }}
-
-      - name: スクリーンショット等を保存
+          MIWA_DRY_RUN: ${{ github.event_name == 'schedule' && '0' || inputs.dry_run }}
+          MIWA_TARGET_DATE: ${{ github.event_name == 'workflow_dispatch' && inputs.target_date || '' }}
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: miwa-screenshots
           path: artifacts/
