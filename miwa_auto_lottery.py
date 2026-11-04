@@ -83,9 +83,15 @@ def error_texts(page):
 def login(page):
     log("ログイン中…")
     page.goto(f"{BASE_URL}/login")
-    page.locator('input[name="email"], input[type="email"]').first.fill(USER_ID)
-    page.locator('input[name="password"], input[type="password"]').first.fill(PASSWORD)
-    page.locator('button[type="submit"], input[type="submit"]').first.click()
+    page.locator('input[name="email"], input[type="email"], input[type="text"]').first.fill(USER_ID)
+    pw = page.locator('input[name="password"], input[type="password"]').first
+    pw.fill(PASSWORD)
+    # ログインボタン（type=submit が無い画面のため「ログイン」の文字でも探す）。無ければ Enter で送信
+    btn = page.locator('button[type="submit"], input[type="submit"], button:has-text("ログイン")')
+    if btn.count():
+        btn.first.click()
+    else:
+        pw.press("Enter")
     try:
         page.wait_for_url(lambda u: "/login" not in u, timeout=20000)
     except PWTimeout:
