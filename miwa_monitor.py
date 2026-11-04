@@ -5,7 +5,8 @@
   ・翌日〜45日後（先着予約の期間）の空きを確認
   ・土日祝に空き → 自動予約（夜枠優先、両方空きなら両方）＋ LINE通知
   ・平日に空き   → LINE通知のみ（同じ枠は24時間に1回まで）
-  ・1回の実行で3回（60秒おき）チェック。平日は1回目のみ確認
+  ・cron-job.org から5分おきに起動。1回の実行でチェック1回
+    （土日祝は毎回、平日は1時間に1回だけ確認）
 
 ブラウザ操作は miwa_auto_lottery.py の関数を共用する（同じフォルダに置くこと）。
 環境変数 MIWA_DRY_RUN=1 のときは予約を確定しない。
@@ -27,8 +28,11 @@ import miwa_auto_lottery as L
 
 LINE_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 DAYS_AHEAD = int(os.environ.get("MIWA_MONITOR_DAYS", "45"))
-LOOP_COUNT = int(os.environ.get("MIWA_MONITOR_LOOPS", "3"))
+# cron-job.org から5分おきに起動される前提で、1回の実行ではチェック1回だけ
+LOOP_COUNT = int(os.environ.get("MIWA_MONITOR_LOOPS", "1"))
 LOOP_INTERVAL_SEC = int(os.environ.get("MIWA_MONITOR_INTERVAL", "60"))
+# 平日（通知のみ）のチェック間隔（分）。土日祝は毎回チェック
+WEEKDAY_EVERY = timedelta(minutes=int(os.environ.get("MIWA_WEEKDAY_EVERY_MIN", "60")))
 COOLDOWN = timedelta(hours=int(os.environ.get("MIWA_NOTIFY_COOLDOWN_HOURS", "24")))
 DRY_RUN = L.DRY_RUN
 
@@ -186,21 +190,39 @@ def book(page, d, slot) -> str:
 # ------------------------------------------------------------
 # 1回分のチェック
 # ------------------------------------------------------------
+def weekday_check_due(st: dict) -> bool:
+    """前回の平日チェックから WEEKDAY_EVERY 以上たっていれば True。"""
+    last = st.get("weekday_checked")
+    try:
+        return not last or datetime.now(JST) - datetime.fromisoformat(last) >= WEEKDAY_EVERY
+    except ValueError:
+        return True
+
+
 def run_once(page, st: dict, first: bool):
-    today = datetime.now(JST).date()
+    now = datetime.now(JST)
+    today = now.date()
     days = [today + timedelta(days=i) for i in range(1, DAYS_AHEAD + 1)]
-    targets = [d for d in days if first or is_holiday(d)]  # 平日は1回目だけ
+    with_weekdays = first and weekday_check_due(st)
+    if with_weekdays:
+        st["weekday_checked"] = now.isoformat()
+        log("  （今回は平日も確認します）")
+    targets = [d for d in days if with_weekdays or is_holiday(d)]
 
     found = 0
-    for d in targets:
+    t_loop = time.time()
+    for n, d in enumerate(targets, 1):
+        wd = "月火水木金土日"[d.weekday()]
+        date_label = f"{d.isoformat()}（{wd}）"
+        t0 = time.time()
         starts = free_starts(page, d)
+        took = f"{time.time() - t0:.1f}秒"
         if not starts:
+            log(f"  [{n}/{len(targets)}] {date_label} 空きなし（{took}）")
             continue
         found += 1
         slots = [s for s in SLOTS if s["start"] in starts]
-        wd = "月火水木金土日"[d.weekday()]
-        date_label = f"{d.isoformat()}（{wd}）"
-        log(f"  🟢 {date_label} 空き: {'・'.join(s['name'] for s in slots)}")
+        log(f"  [{n}/{len(targets)}] 🟢 {date_label} 空き: {'・'.join(s['name'] for s in slots)}（{took}）")
 
         if not is_holiday(d):
             for s in slots:
@@ -225,7 +247,7 @@ def run_once(page, st: dict, first: bool):
                 notify_once(st, key + "_manual",
                             f"🟠【共用施設 空き検知・要手動確認】\n{date_label} {s['name']} に空きがありますが、"
                             f"自動予約できませんでした。お早めに手動でご確認ください。\n\n{FACILITY_URL}")
-    log(f"  チェック {len(targets)}日 ／ 空き {found}日")
+    log(f"  チェック {len(targets)}日 ／ 空き {found}日 ／ 所要 {time.time() - t_loop:.0f}秒")
 
 
 def main() -> int:
@@ -235,7 +257,7 @@ def main() -> int:
 
     log("=" * 50)
     log("共用施設 空き監視・自動予約" + ("（DRY_RUN: 予約しない安全モード）" if DRY_RUN else "（本番）"))
-    log(f"監視期間: 翌日〜{DAYS_AHEAD}日後 ／ {LOOP_COUNT}回チェック")
+    log(f"監視期間: 翌日〜{DAYS_AHEAD}日後（土日祝は毎回・平日は{WEEKDAY_EVERY.seconds // 60}分おき）")
     log("=" * 50)
 
     st = load_state()
