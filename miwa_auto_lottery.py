@@ -72,6 +72,14 @@ def log(msg=""):
     print(msg, flush=True)
 
 
+def wait_idle(page, timeout=15000):
+    """networkidle を待つ。Livewire の定期通信などで idle にならなくても例外にしない。"""
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout)
+    except PWTimeout:
+        pass
+
+
 def shot(page, name):
     """スクリーンショットを artifacts/ に保存（失敗しても処理は止めない）。"""
     try:
@@ -188,21 +196,28 @@ def login(page):
         if page.locator(sel).count():
             page.locator(sel).first.click()
             break
-    page.wait_for_load_state("networkidle", timeout=30000)
+    # ログイン後の遷移を最大約20秒待つ（networkidle にならなくても止めない）
+    for _ in range(20):
+        wait_idle(page, 3000)
+        if "/login" not in page.url:
+            break
+        page.wait_for_timeout(1000)
     if "/login" in page.url:
         shot(page, "login_failed")
+        dump_html(page, "login_failed")
         raise RuntimeError("ログイン失敗（ID/パスワードをご確認ください）")
     log("ログイン成功")
 
 
 def open_facility(page):
     page.goto(FACILITY_URL, wait_until="domcontentloaded", timeout=30000)
-    page.wait_for_load_state("networkidle", timeout=30000)
+    wait_idle(page, 20000)
+    page.wait_for_timeout(1000)
 
 
 def open_calendar(page):
     """日付表示ボタン（wire:click='toggle'）を押してカレンダーを開く。"""
-    btn = page.locator("button", has_text=re.compile(r"\d{4}年\d{2}月\d{2}日"))
+    btn = page.locator("button", has_text=re.compile(r"\d{4}年\d{1,2}月\d{1,2}日"))
     if btn.count():
         btn.first.click()
         page.wait_for_timeout(800)
@@ -308,11 +323,12 @@ def click_date(page, target: date) -> bool:
     res = _js_dispatch_click_by_wire(page, f"selectDate('{iso}')")
     log(f"    selectDate('{iso}') 発火結果: {res}")
     # タイムラインが対象日に切り替わるまで待つ（最大約8秒）
+    if res == "no-el":
+        log("    ⚠️ 対象日のセルが見つかりません（カレンダー内のクリック要素↓）")
+        debug_calendar_clickables(page)
+        return False
     for _ in range(8):
-        try:
-            page.wait_for_load_state("networkidle", timeout=4000)
-        except PWTimeout:
-            pass
+        wait_idle(page, 4000)
         page.wait_for_timeout(600)
         if any(s["date"] == date_slash for s in get_timeline_slots(page)):
             return True
@@ -497,15 +513,90 @@ def _js_check_required_boxes(page) -> int:
         }""")
 
 
+def _tag_option_checkbox(page, opt_id) -> str:
+    """オプション opt_id の『使用する✓』チェックボックスを探し、
+    data-auto-opt 属性で目印を付ける。戻り値: 見つけ方 / 'none'。
+    探し方: ①value か wire:model に opt_id を含む checkbox
+            ②数量select（selectOptionQuantities.{id}）の祖先をたどり、
+              その中にある checkbox が1個だけになる最小の範囲の checkbox"""
+    return page.evaluate(
+        """(id) => {
+            const sid = String(id);
+            const boxes = Array.from(document.querySelectorAll('input[type=checkbox]'));
+            const mark = (b, how) => { b.setAttribute('data-auto-opt', sid); return how; };
+            for (const b of boxes) {
+                const models = b.getAttributeNames().filter(n => n.startsWith('wire:model'))
+                    .map(n => b.getAttribute(n) || '');
+                if (b.value === sid && models.some(m => /option/i.test(m))) return mark(b, 'value');
+                if (models.some(m => new RegExp('[.\\\\[]' + sid + '\\\\]?$').test(m)))
+                    return mark(b, 'model');
+            }
+            const sel = Array.from(document.querySelectorAll('select')).find(e =>
+                e.getAttribute('wire:model.change') === 'selectOptionQuantities.' + sid);
+            if (!sel) return 'none';
+            let node = sel.parentElement;
+            for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
+                const cs = node.querySelectorAll('input[type=checkbox]');
+                if (cs.length === 1) return mark(cs[0], 'ancestor');
+                if (cs.length > 1) break;
+            }
+            return 'none';
+        }""", opt_id)
+
+
+def check_option(page, opt_id) -> bool:
+    """オプションの『使用する✓』をONにする（Livewire の更新通信も待つ）。"""
+    how = _tag_option_checkbox(page, opt_id)
+    if how == "none":
+        log(f"    ⚠️ option {opt_id} のチェックボックスが見つかりません")
+        return False
+    loc = page.locator(f'input[data-auto-opt="{opt_id}"]')
+    if loc.count() and loc.first.is_checked():
+        log(f"    option {opt_id} ✓ は既にON（{how}）")
+        return True
+    try:
+        with page.expect_response(lambda r: "/livewire/update" in r.url, timeout=8000):
+            try:
+                loc.first.check(force=True, timeout=4000)
+            except Exception:
+                # 見た目用の label 等で隠れている場合は JS で直接 ON にする
+                page.evaluate(
+                    """(id) => {
+                        const b = document.querySelector('input[data-auto-opt="' + id + '"]');
+                        if (b && !b.checked) {
+                            b.checked = true;
+                            b.dispatchEvent(new Event('input', {bubbles: true}));
+                            b.dispatchEvent(new Event('change', {bubbles: true}));
+                        }
+                    }""", str(opt_id))
+    except PWTimeout:
+        log(f"    （option {opt_id} ✓ 後に Livewire 通信なし）")
+    page.wait_for_timeout(500)
+    # 再描画で目印が消えることがあるので付け直して確認
+    _tag_option_checkbox(page, opt_id)
+    loc = page.locator(f'input[data-auto-opt="{opt_id}"]')
+    ok = bool(loc.count()) and loc.first.is_checked()
+    log(f"    option {opt_id} ✓ = {'ON' if ok else 'OFF のまま'}（{how}）")
+    return ok
+
+
 def set_options(page, options: dict):
-    """人数オプション（数量select）を設定する。0 の項目は変更しない。"""
+    """人数オプションを設定する。使う項目（1以上）は『✓』をONにしてから数量を選ぶ。
+    0 の項目は変更しない。"""
     for opt_id, value in options.items():
         if value <= 0:
             continue
+        check_option(page, opt_id)
         model = f"selectOptionQuantities.{opt_id}"
         r = change_select_and_wait(page, model, value)
         log(f"    option {opt_id} = {value} 設定（{r}, 現在値={get_select_value(page, model)}）")
+        # 数量変更の再描画で✓が外れていないか確認し、外れていれば付け直す
+        _tag_option_checkbox(page, opt_id)
+        loc = page.locator(f'input[data-auto-opt="{opt_id}"]')
+        if loc.count() and not loc.first.is_checked():
+            check_option(page, opt_id)
     page.wait_for_timeout(800)
+    debug_options(page)
 
 
 def debug_buttons(page, label=""):
@@ -550,10 +641,7 @@ def click_confirm_button(page) -> bool:
             return 'submitted';
         }""")
     log(f"    （フォーム送信: {res}）")
-    try:
-        page.wait_for_load_state("networkidle", timeout=30000)
-    except PWTimeout:
-        pass
+    wait_idle(page, 20000)
     page.wait_for_timeout(1500)
     # 進めたか（フォームの『予約内容を確認する』が消えたか / URL変化）で判定
     still_form = page.locator('button:has-text("予約内容を確認する")').count() > 0
@@ -630,15 +718,13 @@ def finalize_reservation(page, tag: str) -> bool:
     duplicate = False
     body = ""
     for _ in range(12):
-        try:
-            page.wait_for_load_state("networkidle", timeout=4000)
-        except PWTimeout:
-            pass
+        wait_idle(page, 4000)
         page.wait_for_timeout(700)
         body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
         url = page.url
-        if any(k in body for k in DONE_KEYWORDS) or re.search(r"/reserves/\d+", url) \
-                or ("reserve-confirm" not in url and "/facilities/" in url):
+        # 完了は「完了文言」か「/reserves/{id} 到達」でのみ判定する
+        # （施設ページに戻されただけ＝エラーの可能性があるので完了扱いしない）
+        if any(k in body for k in DONE_KEYWORDS) or re.search(r"/reserves/\d+", url):
             done = True
             break
         if any(w in body for w in ("同じ時間に予約", "既に予約", "すでに予約")):
@@ -679,20 +765,32 @@ def _select_through_confirm(page, target: date, slot: dict, tag: str) -> str:
         return "failed"
     shot(page, f"{tag}_4_date_selected")
 
-    select_slot(page, target, slot["start"])
+    if not select_slot(page, target, slot["start"]):
+        # 目的の枠を選べないまま進むと、自動選択された別の枠で申込んでしまうため中止
+        shot(page, f"{tag}_5_slot_select_failed")
+        dump_html(page, f"{tag}_5_slot_select_failed")
+        return "failed"
     shot(page, f"{tag}_5_slot_selected")
 
     set_options(page, slot["options"])
     shot(page, f"{tag}_6_options_set")
+    dump_html(page, f"{tag}_6_options_set")
+
+    # 送信直前に、選択中の枠が目的の枠のままか再確認（オプション変更で戻る場合に備える）
+    want = f"{target.strftime('%Y-%m-%d')} {slot['start']}"
+    if not get_selected_start(page).startswith(want):
+        log(f"    ⚠️ 送信直前の選択枠が {get_selected_start(page)!r} で目的と違うため中止")
+        return "failed"
 
     if click_confirm_button(page):
         return "confirmed"
 
     # 進めなかった場合、既に予約済み等の判定（無駄な再試行を避ける）
+    # ※「予約済み」等は凡例・枠表示にも出るため使わず、エラーメッセージ特有の文言のみで判定
     body = " ".join((page.evaluate("() => document.body.innerText") or "").split())
-    if any(w in body for w in ("同じ時間に予約", "既に予約", "すでに予約",
-                               "予約済み", "申込済み", "申込み済み")):
+    if any(w in body for w in ("同じ時間に予約", "既に予約されています", "すでに予約されています")):
         return "already"
+    dump_html(page, f"{tag}_7_confirm_fail")
     return "failed"
 
 
@@ -753,11 +851,11 @@ def send_line(message: str):
 # ============================================================
 def main():
     if not BASE_URL or not FACILITY_ID:
-        log("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID_RESERVE が未設定です")
-        return
+        log("⚠️ MIWA_BASE_URL / MIWA_FACILITY_ID_RESERVE が未設定です（GitHub Secrets を確認）")
+        return 1
     if not USER_ID or not PASSWORD:
-        log("⚠️ MIWA_USER_ID / MIWA_PASSWORD が未設定です")
-        return
+        log("⚠️ MIWA_USER_ID / MIWA_PASSWORD が未設定です（GitHub Secrets を確認）")
+        return 1
 
     target = date.today() + timedelta(days=DAYS_AHEAD)
     weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target.weekday()]
@@ -769,7 +867,7 @@ def main():
 
     if not is_weekend_or_holiday(target):
         log("→ 平日のためスキップ")
-        return
+        return 0
 
     holiday_name = ""
     if jpholiday:
@@ -783,6 +881,7 @@ def main():
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             locale="ja-JP",
+            timezone_id="Asia/Tokyo",
             user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"),
@@ -795,7 +894,7 @@ def main():
             log(f"⚠️ {e}")
             traceback.print_exc()
             browser.close()
-            return
+            return 1
 
         for slot in SLOTS:
             try:
@@ -815,12 +914,16 @@ def main():
     log("\n" + "=" * 50)
     log("結果:" + ("（DRY_RUN: 確定はしていません）" if DRY_RUN else ""))
     label = {"applied": "✅ 申込完了", "partial": "🟠 要手動確認", "failed": "❌ 失敗"}
-    lines = []
     for name, outcome in results:
         log(f"  {name}: {label.get(outcome, outcome)}")
     log("=" * 50)
     # LINE通知は不要のため送信しない（結果はログ／スクショで確認）
 
+    # 失敗があれば終了コード1にして、GitHub Actions 上で赤（失敗）表示にする。
+    # 本番で「未確定(partial)」も失敗扱い。DRY_RUN では partial は想定どおりなので成功扱い。
+    bad = {"failed"} if DRY_RUN else {"failed", "partial"}
+    return 1 if any(o in bad for _, o in results) else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
