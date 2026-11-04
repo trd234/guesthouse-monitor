@@ -429,10 +429,11 @@ def _settle_after_select(page, want: str) -> bool:
     return ok
 
 
-def select_slot(page, target: date, start_label: str) -> bool:
+def select_slot(page, target: date, start_label: str) -> str:
     """親フォームの selectStartDateTime プルダウンを直接設定して枠を選ぶ
     （タイムラインの子→親伝播を回避）。自動選択済みでも必ず明示設定して
-    サーバー側に枠・予約番号を確定登録させ、再描画が安定するまで待つ。"""
+    サーバー側に枠・予約番号を確定登録させ、再描画が安定するまで待つ。
+    戻り値: 'ok' / 'unavailable'（その日は予約可の枠なし＝正月等） / 'failed'。"""
     want = f"{target.strftime('%Y-%m-%d')} {start_label}"  # 例 '2026-08-15 17:00'
 
     opts = get_select_options(page, "selectStartDateTime")
@@ -441,7 +442,14 @@ def select_slot(page, target: date, start_label: str) -> bool:
                 if o["value"].startswith(want) or o["text"].strip() == start_label), None)
     if not opt:
         log(f"    ⚠️ {start_label} の選択肢が見つかりません")
-        return False
+        # タイムライン上の枠の状態を確認し、予約可の枠が無ければ『申込対象なし』
+        date_slash = target.strftime("%Y/%m/%d")
+        day_slots = [s for s in get_timeline_slots(page) if s["date"] == date_slash]
+        statuses = sorted({s["status"] for s in day_slots})
+        log(f"    タイムライン枠の状態: {statuses}（{len(day_slots)}枠）")
+        if day_slots and not any(s["status"] == "予約可" for s in day_slots):
+            return "unavailable"
+        return "failed"
 
     # すでに目的値の場合でも確実にサーバー登録させるため、一旦別の枠を選んでから戻す。
     if get_selected_start(page).startswith(want):
@@ -455,10 +463,10 @@ def select_slot(page, target: date, start_label: str) -> bool:
 
     if _settle_after_select(page, want):
         log(f"    選択OK selectReserveNumber={get_select_value(page, 'selectReserveNumber')}")
-        return True
+        return "ok"
     log(f"    ⚠️ selectStartDateTime が {want} になりませんでした"
         f"（現在: {get_selected_start(page)}）")
-    return False
+    return "failed"
 
 
 def debug_options(page):
@@ -765,7 +773,11 @@ def _select_through_confirm(page, target: date, slot: dict, tag: str) -> str:
         return "failed"
     shot(page, f"{tag}_4_date_selected")
 
-    if not select_slot(page, target, slot["start"]):
+    sel = select_slot(page, target, slot["start"])
+    if sel == "unavailable":
+        shot(page, f"{tag}_5_unavailable")
+        return "unavailable"
+    if sel != "ok":
         # 目的の枠を選べないまま進むと、自動選択された別の枠で申込んでしまうため中止
         shot(page, f"{tag}_5_slot_select_failed")
         dump_html(page, f"{tag}_5_slot_select_failed")
@@ -804,11 +816,14 @@ def apply_slot(page, target: date, slot: dict) -> str:
     outcome = "failed"
     for attempt in range(1, 4):
         outcome = _select_through_confirm(page, target, slot, tag)
-        if outcome in ("confirmed", "already"):
+        if outcome in ("confirmed", "already", "unavailable"):
             break
         log(f"    確認ページに進めませんでした（試行 {attempt}/3）。最初からやり直します")
         page.wait_for_timeout(1500)
 
+    if outcome == "unavailable":
+        log("    ➖ この日は予約可の枠がありません（休館日・正月など）。申込対象外としてスキップ")
+        return "unavailable"
     if outcome == "already":
         log("    ℹ️ その枠は既に申込/予約済みです（スキップ）")
         return "applied"
@@ -857,24 +872,35 @@ def main():
         log("⚠️ MIWA_USER_ID / MIWA_PASSWORD が未設定です（GitHub Secrets を確認）")
         return 1
 
-    target = date.today() + timedelta(days=DAYS_AHEAD)
+    # 手動実行で対象日が指定された場合はその日（曜日・祝日の制約なし）
+    manual_date = os.environ.get("MIWA_TARGET_DATE", "").strip()
+    if manual_date:
+        try:
+            target = datetime.strptime(manual_date, "%Y-%m-%d").date()
+        except ValueError:
+            log(f"⚠️ 対象日の指定 '{manual_date}' が不正です（YYYY-MM-DD 形式で入力）")
+            return 1
+    else:
+        target = date.today() + timedelta(days=DAYS_AHEAD)
     weekday_ja = ["月", "火", "水", "木", "金", "土", "日"][target.weekday()]
 
     log("=" * 50)
     log("共用施設 抽選自動申込" + ("（DRY_RUN: 予約しない安全モード）" if DRY_RUN else ""))
-    log(f"対象日: {target}（{weekday_ja}）")
+    log(f"対象日: {target}（{weekday_ja}）" + ("　※手動指定" if manual_date else ""))
     log("=" * 50)
 
-    if not is_weekend_or_holiday(target):
-        log("→ 平日のためスキップ")
-        return 0
-
-    holiday_name = ""
-    if jpholiday:
-        h = jpholiday.is_holiday_name(target)
-        if h:
-            holiday_name = f"（{h}）"
-    log(f"→ 土日祝{holiday_name}のため抽選申込を実行")
+    if manual_date:
+        log("→ 対象日が手動指定されたため、曜日・祝日に関係なく実行")
+    else:
+        if not is_weekend_or_holiday(target):
+            log("→ 平日のためスキップ")
+            return 0
+        holiday_name = ""
+        if jpholiday:
+            h = jpholiday.is_holiday_name(target)
+            if h:
+                holiday_name = f"（{h}）"
+        log(f"→ 土日祝{holiday_name}のため抽選申込を実行")
 
     results = []
     with sync_playwright() as p:
@@ -913,7 +939,8 @@ def main():
 
     log("\n" + "=" * 50)
     log("結果:" + ("（DRY_RUN: 確定はしていません）" if DRY_RUN else ""))
-    label = {"applied": "✅ 申込完了", "partial": "🟠 要手動確認", "failed": "❌ 失敗"}
+    label = {"applied": "✅ 申込完了", "partial": "🟠 要手動確認", "failed": "❌ 失敗",
+             "unavailable": "➖ 予約不可日のため対象外"}
     for name, outcome in results:
         log(f"  {name}: {label.get(outcome, outcome)}")
     log("=" * 50)
