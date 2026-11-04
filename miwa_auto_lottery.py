@@ -100,8 +100,9 @@ def login(page):
     log("ログイン成功")
 
 
-def select_date(page, target: date) -> bool:
-    """施設ページを開き、カレンダーで対象日を選ぶ。"""
+def select_date(page, target: date, wait_tries: int = 20) -> bool:
+    """施設ページを開き、カレンダーで対象日を選ぶ。
+    wait_tries: 開始時刻の選択肢が出るのを待つ回数（0.5秒単位。監視では短くする）"""
     page.goto(f"{BASE_URL}/facilities/{FACILITY_ID}")
     toggle = page.locator('button[wire\\:click\\.prevent\\.stop="toggle"]').first
     toggle.wait_for()
@@ -132,7 +133,7 @@ def select_date(page, target: date) -> bool:
     lw(page, click_day)
 
     # 開始時刻の選択肢が対象日のものに切り替わるまで待つ
-    for _ in range(20):
+    for _ in range(wait_tries):
         values = page.locator(f"{SEL_START} option").evaluate_all("os => os.map(o => o.value)")
         if any(v.startswith(iso) for v in values):
             return True
